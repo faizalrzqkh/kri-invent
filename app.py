@@ -105,6 +105,25 @@ def norm_col(c):
     return re.sub(r"[^a-z0-9]", "", str(c).lower())
 
 
+STATUS_COLS = ["Ansible Status", "NGPAM Status", "XDR Status"]
+
+
+def norm_status(v):
+    """
+    Seragamkan penulisan status integrasi:
+      integrated / Integrated / INTEGRATED                  -> INTEGRATED
+      not integrated / Not-Integrated / non integrated ...  -> NOT_INTEGRATED
+    Nilai lain (mis. Installed, Not Installed, kosong) dibiarkan apa adanya.
+    """
+    s = clean(v)
+    key = re.sub(r"[^a-z]", "", s.lower())
+    if key in ("integrated", "integrate"):
+        return "INTEGRATED"
+    if key in ("notintegrated", "notintegrate", "nonintegrated", "unintegrated", "belumintegrated"):
+        return "NOT_INTEGRATED"
+    return s
+
+
 def host_key(v):
     """
     Kunci pencocokan hostname = bagian sebelum titik pertama, huruf kecil, tanpa spasi.
@@ -180,6 +199,11 @@ def compute(re_df, kri_df, opts=None):
     o = {**DEFAULT_OPTIONS, **(opts or {})}
     re_df = re_df.copy()
     kri_df = kri_df.copy()
+
+    # seragamkan penulisan status (INTEGRATED / NOT_INTEGRATED) di kedua sumber sebelum dibandingkan
+    for df in (re_df, kri_df):
+        for col in STATUS_COLS:
+            df[col] = df[col].map(norm_status)
 
     re_df["_key"] = re_df["Hostname"].map(host_key)
     kri_df["_key"] = kri_df["Hostname"].map(host_key)
