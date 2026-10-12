@@ -82,7 +82,12 @@ COLORS = {
 # ----------------------------------------------------------------------------
 # HELPER
 # ----------------------------------------------------------------------------
+_INVISIBLE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u00ad]")  # zero-width, BOM, soft-hyphen
+_SPACES = re.compile(r"\s+")  # spasi, tab, enter, NBSP, dan spasi unicode lain
+
+
 def clean(v):
+    """Bersihkan nilai sel: buang karakter tak terlihat, rapikan spasi ganda/tab/enter, trim kiri-kanan."""
     if v is None:
         return ""
     if not isinstance(v, str):
@@ -91,7 +96,8 @@ def clean(v):
                 return ""
         except (TypeError, ValueError):
             pass
-    s = str(v).replace("\xa0", " ").strip()
+    s = _INVISIBLE.sub("", str(v))
+    s = _SPACES.sub(" ", s).strip()
     return "" if s.lower() in ("nan", "nat", "none") else s
 
 
@@ -100,13 +106,20 @@ def norm_col(c):
 
 
 def host_key(v):
-    """hostname1.telkomsel.co.id -> hostname1 (case-insensitive)."""
-    s = clean(v).lower()
+    """
+    Kunci pencocokan hostname = bagian sebelum titik pertama, huruf kecil, tanpa spasi.
+      hostname1.telkomsel.co.id -> hostname1
+      HostName1.apa.saja.com    -> hostname1
+      ' hostname1 '             -> hostname1
+      hostname1.                -> hostname1
+    Pengecualian: jika isinya alamat IP (10.1.1.1) dipakai utuh.
+    """
+    s = _SPACES.sub("", _INVISIBLE.sub("", clean(v))).lower().strip(".")
     if not s:
         return ""
     if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", s):
         return s
-    return s.split(".")[0].strip()
+    return s.split(".")[0]
 
 
 def ip_set(v):
@@ -246,7 +259,7 @@ def compute(re_df, kri_df, opts=None):
                     new, src, why = decide(kv, rv, kr["_dt"])
                 else:  # kolom lain: hanya isi jika Re-invent kosong
                     new, src, why = (rv, "Re-invent", "") if rv else (kv, "KRI", "Re-invent kosong")
-                if new != rv:
+                if new.casefold() != rv.casefold():
                     res.at[i, rcol] = new
                     log.append({"Hostname": row["Hostname"], "Field": rcol, "Nilai Re-invent (lama)": rv,
                                 "Nilai baru": new, "Sumber": src, "Alasan": why})
@@ -618,6 +631,13 @@ def main():
                        XLSX, type="primary")
     d2.download_button("⬇️ Download FILE LAPORAN (IP sama, dismantle, log, dll)", report_bytes,
                        "Laporan_Perbandingan.xlsx", XLSX)
+
+    with st.expander("🔎 Cek kunci pencocokan hostname (hostname1.domain apa saja → hostname1)"):
+        chk = pd.concat([
+            pd.DataFrame({"Sumber": "Re-invent", "Hostname asli": re_df["Hostname"], "Kunci": re_df["Hostname"].map(host_key)}),
+            pd.DataFrame({"Sumber": "KRI", "Hostname asli": kri_df["Hostname"], "Kunci": kri_df["Hostname"].map(host_key)}),
+        ], ignore_index=True)
+        st.dataframe(chk, hide_index=True)
 
     tabs = st.tabs(["File utama", "KRI tidak ada di Re-invent", "Re-invent tidak ada di KRI",
                     "IP sama, hostname beda", "Hostname sama, IP beda", "Dismantle",
