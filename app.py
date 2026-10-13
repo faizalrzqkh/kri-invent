@@ -71,11 +71,22 @@ DEFAULT_OPTIONS = dict(
     split_incomplete=False,
 )
 
+# Warna seluruh baris di file utama (jika ada beberapa masalah, dipakai urutan prioritas ini)
 COLORS = {
-    "ip": "FFE699",         # kuning : hostname beda, IP sama
-    "inc": "F4B084",        # oranye : Hostname / VM-Baremetal kosong
-    "dismantle": "D9D9D9",  # abu    : dismantle
-    "new": "C6E0B4",        # hijau  : baris baru dari KRI
+    "ip": "FFE699",         # kuning  : hostname beda, IP sama
+    "hip": "BDD7EE",        # biru    : hostname sama, IP beda
+    "dup": "E4DFEC",        # ungu    : hostname duplikat
+    "inc": "F4B084",        # oranye  : Hostname / VM-Baremetal kosong
+    "dismantle": "D9D9D9",  # abu     : dismantle
+    "new": "C6E0B4",        # hijau   : baris baru dari KRI
+}
+# Warna sel yang bermasalah (lebih pekat) - selalu ditampilkan walau satu baris punya banyak masalah
+CELL_COLORS = {
+    "ip": "FFC000",         # sel ip_oam
+    "hip": "5B9BD5",        # sel ip_oam
+    "dup": "8E7CC3",        # sel Hostname
+    "inc": "ED7D31",        # sel Hostname / VM-Baremetal yang kosong
+    "dismantle": "A6A6A6",  # sel Lifecycle
 }
 
 
@@ -356,9 +367,22 @@ def compute(re_df, kri_df, opts=None):
         if k in kri_idx.index:
             a, b = ip_set(row["ip_oam"]), ip_set(kri_idx.at[k, "IP OAM"])
             if a and b and a.isdisjoint(b):
+                vm_re, vm_kri = row["VM/Baremetal"], kri_idx.at[k, "VM/Baremetal"]
+                ket = "Hostname sama tetapi IP berbeda - cek IP mana yang benar (file utama mempertahankan IP Re-invent)"
+                if vm_re and vm_kri and vm_re.casefold() != vm_kri.casefold():
+                    ket += "; VM/Baremetal juga berbeda"
                 hip.append({"Hostname Re-invent": row["Hostname"], "Hostname KRI": kri_idx.at[k, "Hostname"],
-                            "ip_oam Re-invent": row["ip_oam"], "IP OAM KRI": kri_idx.at[k, "IP OAM"]})
-    hip_df = pd.DataFrame(hip, columns=["Hostname Re-invent", "Hostname KRI", "ip_oam Re-invent", "IP OAM KRI"])
+                            "ip_oam Re-invent": row["ip_oam"], "IP OAM KRI": kri_idx.at[k, "IP OAM"],
+                            "VM/Baremetal Re-invent": vm_re, "VM/Baremetal KRI": vm_kri,
+                            "Keterangan": ket})
+                flags[i].add("hip")
+    hip_df = pd.DataFrame(hip, columns=["Hostname Re-invent", "Hostname KRI", "ip_oam Re-invent", "IP OAM KRI",
+                                        "VM/Baremetal Re-invent", "VM/Baremetal KRI", "Keterangan"])
+
+    # --- hostname duplikat (di Re-invent maupun KRI) -> tandai baris terkait ---
+    for k in set(dup_re["_key"]) | set(dup_kri["_key"]):
+        for j in key_to_idx.get(k, []):
+            flags[j].add("dup")
 
     # --- kelengkapan wajib: Hostname & VM/Baremetal --------------------------
     for idx, row in res.iterrows():
@@ -373,6 +397,10 @@ def compute(re_df, kri_df, opts=None):
         out = []
         if "ip" in flags[idx]:
             out.append("Hostname beda/IP sama")
+        if "hip" in flags[idx]:
+            out.append("Hostname sama/IP beda")
+        if "dup" in flags[idx]:
+            out.append("Hostname duplikat")
         if "inc" in flags[idx]:
             out.append("Hostname/VM-Baremetal kosong")
         if res.at[idx, "Lifecycle"] == "dismantle":
@@ -387,16 +415,33 @@ def compute(re_df, kri_df, opts=None):
     if o["add_note"]:
         main["Catatan"] = [label(i) for i in main_res.index]
 
-    colors = {}
+    colors, cells = {}, []
     for pos, idx in enumerate(main_res.index):
-        if "ip" in flags[idx]:
-            colors[pos] = COLORS["ip"]
-        elif "inc" in flags[idx]:
-            colors[pos] = COLORS["inc"]
-        elif res.at[idx, "Lifecycle"] == "dismantle":
-            colors[pos] = COLORS["dismantle"]
-        elif "new" in flags[idx]:
-            colors[pos] = COLORS["new"]
+        f = flags[idx]
+        is_dis = res.at[idx, "Lifecycle"] == "dismantle"
+        for key in ("ip", "hip", "dup", "inc"):          # urutan = prioritas warna baris
+            if key in f:
+                colors[pos] = COLORS[key]
+                break
+        else:
+            if is_dis:
+                colors[pos] = COLORS["dismantle"]
+            elif "new" in f:
+                colors[pos] = COLORS["new"]
+        # warna sel yang bermasalah
+        if "ip" in f:
+            cells.append((pos, "ip_oam", CELL_COLORS["ip"]))
+        if "hip" in f:
+            cells.append((pos, "ip_oam", CELL_COLORS["hip"]))
+        if "dup" in f:
+            cells.append((pos, "Hostname", CELL_COLORS["dup"]))
+        if "inc" in f:
+            if not res.at[idx, "Hostname"]:
+                cells.append((pos, "Hostname", CELL_COLORS["inc"]))
+            if not res.at[idx, "VM/Baremetal"]:
+                cells.append((pos, "VM/Baremetal", CELL_COLORS["inc"]))
+        if is_dis:
+            cells.append((pos, "Lifecycle", CELL_COLORS["dismantle"]))
 
     incomplete_df = res.loc[inc_idx, REINVENT_COLS].copy()
     incomplete_df.insert(0, "Masalah", [
@@ -423,7 +468,7 @@ def compute(re_df, kri_df, opts=None):
         ("Total baris file utama", len(main)),
     ], columns=["Keterangan", "Jumlah"])
 
-    return dict(main=main, colors=colors, kri_only=kri_only_df, re_only=re_only_df, conf=conf_df,
+    return dict(main=main, colors=colors, cells=cells, kri_only=kri_only_df, re_only=re_only_df, conf=conf_df,
                 hip=hip_df, dismantle=dismantle_df, incomplete=incomplete_df, dup=dup_report,
                 log=log_df, summary=summary)
 
@@ -434,9 +479,14 @@ def compute(re_df, kri_df, opts=None):
 MAIN_SHEET = "Reinvent_Updated"
 
 
-def to_excel(sheets, highlights=None):
-    """sheets: {nama_sheet: DataFrame}; highlights: {nama_sheet: {posisi_baris: hex_warna}}"""
+def to_excel(sheets, highlights=None, cell_highlights=None):
+    """
+    sheets          : {nama_sheet: DataFrame}
+    highlights      : {nama_sheet: {posisi_baris: hex_warna}}          -> warna satu baris penuh
+    cell_highlights : {nama_sheet: [(posisi_baris, nama_kolom, hex)]}  -> warna sel tertentu
+    """
     highlights = highlights or {}
+    cell_highlights = cell_highlights or {}
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         for name, df in sheets.items():
@@ -453,12 +503,18 @@ def to_excel(sheets, highlights=None):
                 fill = PatternFill("solid", start_color=color, end_color=color)
                 for c in ws[pos + 2]:
                     c.fill = fill
+            cols = list(df.columns)
+            for pos, col, color in cell_highlights.get(name, []):
+                if col in cols:
+                    ws.cell(row=pos + 2, column=cols.index(col) + 1).fill = PatternFill(
+                        "solid", start_color=color, end_color=color)
     return buf.getvalue()
 
 
 def build_outputs(result):
     """Bangun 2 file Excel (bytes): file utama & file laporan."""
-    main_bytes = to_excel({MAIN_SHEET: result["main"]}, {MAIN_SHEET: result["colors"]})
+    main_bytes = to_excel({MAIN_SHEET: result["main"]}, {MAIN_SHEET: result["colors"]},
+                          {MAIN_SHEET: result["cells"]})
     report_sheets = {
         "Ringkasan": result["summary"],
         "KRI_Tidak_Ada_di_Reinvent": result["kri_only"],
@@ -647,8 +703,10 @@ def main():
     c[2].metric("Hostname/VM kosong", s["Hostname / VM-Baremetal kosong"])
     c[3].metric("Perubahan nilai", s["Jumlah perubahan nilai"])
 
-    st.markdown("**Warna di file utama:** 🟨 hostname beda IP sama · 🟧 Hostname/VM-Baremetal kosong · "
-                "⬜ dismantle · 🟩 baris baru dari KRI")
+    st.markdown("**Warna di file utama:** 🟨 hostname beda IP sama · 🟦 hostname sama IP beda · "
+                "🟪 hostname duplikat · 🟧 Hostname/VM-Baremetal kosong · ⬜ dismantle · 🟩 baris baru dari KRI  \n"
+                "<small>Seluruh baris diwarnai sesuai masalah utama, sel yang bermasalah (ip_oam / Hostname / "
+                "VM-Baremetal / Lifecycle) diwarnai lebih pekat.</small>", unsafe_allow_html=True)
 
     d1, d2 = st.columns(2)
     d1.download_button("⬇️ Download FILE UTAMA (format Re-invent)", main_bytes, "Reinvent_Updated.xlsx",
