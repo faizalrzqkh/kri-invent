@@ -5,6 +5,7 @@ Jalankan:  streamlit run app.py
 Isi file:  1) definisi kolom  2) helper  3) logika perbandingan  4) export Excel
            5) data contoh (dummy)  6) tampilan Streamlit
 """
+import hashlib
 import io
 import re
 from collections import defaultdict
@@ -113,6 +114,19 @@ def clean(v):
     return "" if s.lower() in ("nan", "nat", "none") else s
 
 
+def nospace(v):
+    """Hilangkan SEMUA spasi (juga tab / enter / NBSP) dari nilai. 'host1 / host2' -> 'host1/host2'."""
+    return _SPACES.sub("", clean(v))
+
+
+# kolom identitas (hostname & IP): semua spasinya dibuang saat data dibaca
+NOSPACE_COLS = {
+    "Hostname", "ip_oam", "ip_service", "IP OAM", "IP Services", "IP", "Hostname OS",
+    "Hostname Re-invent", "Hostname KRI", "ip_oam Re-invent", "IP OAM KRI",
+    "Validasi Final Hostname", "Validasi IP_OAM",
+}
+
+
 def norm_col(c):
     return re.sub(r"[^a-z0-9]", "", str(c).lower())
 
@@ -157,6 +171,58 @@ def ip_set(v):
     return set(re.findall(r"\d{1,3}(?:\.\d{1,3}){3}", clean(v)))
 
 
+def ip_tokens(v):
+    """Daftar IP dengan urutan asli, tanpa duplikat."""
+    return list(dict.fromkeys(re.findall(r"\d{1,3}(?:\.\d{1,3}){3}", clean(v))))
+
+
+def split_slash(v):
+    """'xxx / xxxx' atau 'xxx/xxxx' -> ['xxx', 'xxxx'] (spasi dibuang, bagian kosong dibuang)."""
+    return [p for p in nospace(v).split("/") if p]
+
+
+def resolve_slash_hostnames(re_df, kri_df):
+    """
+    Hostname berisi dua nilai dipisah tanda '/'  ( xxx / xxxx  atau  xxx/xxxx ).
+    Tiap bagian (depan & belakang '/') dicocokkan dengan hostname di file lawannya
+    (aturan titik tetap berlaku: host1.domain.com == host1). Bagian yang cocok dipertahankan,
+    bagian lain dihapus. df diubah langsung (in-place).
+    return: (DataFrame ringkasan, list log perubahan)
+    """
+    sides = {"Re-invent": re_df, "KRI": kri_df}
+    other = {"Re-invent": "KRI", "KRI": "Re-invent"}
+    keys = {n: {host_key(p) for v in d["Hostname"] for p in split_slash(v)} for n, d in sides.items()}
+    full = {n: {nospace(v).lower() for v in d["Hostname"]} for n, d in sides.items()}
+    rows, log = [], []
+    for name, df in sides.items():
+        oth = other[name]
+        for i, v in df["Hostname"].items():
+            if "/" not in v:
+                continue
+            parts = split_slash(v)
+            hit = [p for p in parts if host_key(p) in keys[oth]]
+            hit_keys = list(dict.fromkeys(host_key(p) for p in hit))
+            if len(parts) <= 1:
+                new, status, ket = (parts[0] if parts else ""), "Dirapikan", "Tanda / tanpa pasangan dibuang"
+            elif v.lower() in full[oth]:
+                new, status, ket = v, "Sama persis", f"Nilai yang sama (dengan /) juga ada di {oth}; dibiarkan"
+            elif len(hit_keys) == 1:
+                new, status = hit[0], "Dipilih"
+                ket = f"Hanya bagian ini yang ada di {oth}; bagian lain dihapus"
+            elif len(hit_keys) > 1:
+                new, status = hit[0], "Perlu dicek"
+                ket = f"Dua bagian sama-sama ada di {oth}; dipakai bagian pertama - cek manual"
+            else:
+                new, status = "/".join(parts), "Belum terselesaikan"
+                ket = f"Tidak ada bagian yang cocok di {oth}; nilai dibiarkan"
+            rows.append({"Sumber": name, "Hostname asli": v, "Hasil": new, "Status": status, "Keterangan": ket})
+            if new != v:
+                df.at[i, "Hostname"] = new
+                log.append({"Hostname": new, "Field": "Hostname (tanda /)", "Nilai Re-invent (lama)": v,
+                            "Nilai baru": new, "Sumber": name, "Alasan": ket})
+    return pd.DataFrame(rows, columns=["Sumber", "Hostname asli", "Hasil", "Status", "Keterangan"]), log
+
+
 def parse_dates(series):
     """
     Format ISO (2026-10-01 / 2026-10-01 08:00:00) dibaca apa adanya.
@@ -199,7 +265,7 @@ def standardize(df, canon, aliases):
         df[c] = ""
     df = df[canon].copy()
     for c in df.columns:
-        df[c] = df[c].map(clean)
+        df[c] = df[c].map(nospace if c in NOSPACE_COLS else clean)
     return df.reset_index(drop=True), missing
 
 
@@ -221,6 +287,9 @@ def compute(re_df, kri_df, opts=None):
     for df in (re_df, kri_df):
         for col in STATUS_COLS:
             df[col] = df[col].map(norm_status)
+
+    # hostname "xxx / xxxx": ambil bagian yang cocok dengan file lawan, bagian lain dihapus
+    slash_df, slash_log = resolve_slash_hostnames(re_df, kri_df)
 
     re_df["_key"] = re_df["Hostname"].map(host_key)
     kri_df["_key"] = kri_df["Hostname"].map(host_key)
@@ -274,7 +343,7 @@ def compute(re_df, kri_df, opts=None):
             return rv, "Re-invent", f"Re-invent {reinvent_dt:%Y-%m-%d} lebih baru dari KRI {kdt:%Y-%m-%d}"
         return kv, "KRI", "Tanggal tidak tersedia, default KRI"
 
-    log = []
+    log = list(slash_log)
     res = re_df.copy()
     res["_src"] = "Re-invent saja"
 
@@ -292,6 +361,14 @@ def compute(re_df, kri_df, opts=None):
             kr = kri_idx.loc[k]
             res.at[i, "_src"] = "Re-invent + KRI"
             remark_texts = [kr[c] for c in o["remark_cols"]]
+            # ip_oam berisi beberapa IP (a/b): pertahankan yang sama dengan KRI saja
+            a_tok, b_set = ip_tokens(row["ip_oam"]), ip_set(kr["IP OAM"])
+            keep = [t for t in a_tok if t in b_set]
+            if len(a_tok) > 1 and 0 < len(keep) < len(a_tok):
+                res.at[i, "ip_oam"] = "/".join(keep)
+                log.append({"Hostname": row["Hostname"], "Field": "ip_oam (tanda /)",
+                            "Nilai Re-invent (lama)": row["ip_oam"], "Nilai baru": "/".join(keep),
+                            "Sumber": "KRI", "Alasan": "Hanya IP yang sama dengan KRI dipertahankan"})
             for kcol, rcol in KRI_TO_REINVENT.items():
                 if rcol == "Hostname":
                     continue
@@ -398,55 +475,21 @@ def compute(re_df, kri_df, opts=None):
     excluded = set(inc_idx) if o["split_incomplete"] else set()
 
     # --- bentuk file utama ---------------------------------------------------
-    def label(idx):
-        out = []
-        if "ip" in flags[idx]:
-            out.append("Hostname beda/IP sama")
-        if "hip" in flags[idx]:
-            out.append("Hostname sama/IP beda")
-        if "dup" in flags[idx]:
-            out.append("Hostname duplikat")
-        if "inc" in flags[idx]:
-            out.append("Hostname/VM-Baremetal kosong")
-        if res.at[idx, "Lifecycle"] == "dismantle":
-            out.append("Dismantle")
-        if "new" in flags[idx]:
-            out.append("Baru dari KRI")
-        return "; ".join(out)
-
+    # nomor, warna & catatan dihitung di finalize_main() supaya bisa diulang setelah duplikat dihapus
     main_res = res[~res.index.isin(excluded)]
-    main = main_res[REINVENT_COLS].copy().reset_index(drop=True)
-    main["No"] = list(range(1, len(main) + 1))
-    if o["add_note"]:
-        main["Catatan"] = [label(i) for i in main_res.index]
-
-    colors, cells = {}, []
-    for pos, idx in enumerate(main_res.index):
-        f = flags[idx]
-        is_dis = res.at[idx, "Lifecycle"] == "dismantle"
-        for key in ("ip", "hip", "dup", "inc"):          # urutan = prioritas warna baris
-            if key in f:
-                colors[pos] = COLORS[key]
-                break
-        else:
-            if is_dis:
-                colors[pos] = COLORS["dismantle"]
-            elif "new" in f:
-                colors[pos] = COLORS["new"]
-        # warna sel yang bermasalah
-        if "ip" in f:
-            cells.append((pos, "ip_oam", CELL_COLORS["ip"]))
-        if "hip" in f:
-            cells.append((pos, "ip_oam", CELL_COLORS["hip"]))
-        if "dup" in f:
-            cells.append((pos, "Hostname", CELL_COLORS["dup"]))
-        if "inc" in f:
-            if not res.at[idx, "Hostname"]:
-                cells.append((pos, "Hostname", CELL_COLORS["inc"]))
-            if not res.at[idx, "VM/Baremetal"]:
-                cells.append((pos, "VM/Baremetal", CELL_COLORS["inc"]))
-        if is_dis:
-            cells.append((pos, "Lifecycle", CELL_COLORS["dismantle"]))
+    base = main_res[REINVENT_COLS].copy().reset_index(drop=True)
+    dup_re_keys, dup_kri_keys = set(dup_re["_key"]), set(dup_kri["_key"])
+    meta = []
+    for idx in main_res.index:
+        k = res.at[idx, "_key"]
+        meta.append(dict(
+            key=k, flags=set(flags[idx]) - {"dup", "inc"},
+            dup_re=k in dup_re_keys, dup_kri=k in dup_kri_keys,
+            host_empty=not res.at[idx, "Hostname"], vm_empty=not res.at[idx, "VM/Baremetal"],
+            dismantle=res.at[idx, "Lifecycle"] == "dismantle",
+        ))
+    M = dict(base=base, meta=meta, add_note=o["add_note"])
+    main, colors, cells = finalize_main(M)
 
     incomplete_df = res.loc[inc_idx, REINVENT_COLS].copy()
     incomplete_df.insert(0, "Masalah", [
@@ -469,13 +512,93 @@ def compute(re_df, kri_df, opts=None):
         ("Lifecycle = dismantle", len(dismantle_df)),
         ("Hostname / VM-Baremetal kosong", len(inc_idx)),
         ("Duplikat hostname", len(dup_report)),
+        ("Hostname bertanda / (diproses)", len(slash_df)),
         ("Jumlah perubahan nilai", len(log_df)),
         ("Total baris file utama", len(main)),
     ], columns=["Keterangan", "Jumlah"])
 
     return dict(main=main, colors=colors, cells=cells, kri_only=kri_only_df, re_only=re_only_df, conf=conf_df,
                 hip=hip_df, dismantle=dismantle_df, incomplete=incomplete_df, dup=dup_report,
-                log=log_df, summary=summary)
+                log=log_df, summary=summary, slash=slash_df, M=M)
+
+
+def finalize_main(M, deleted=()):
+    """
+    Bentuk file utama dari hasil compute(): buang baris yang dipilih untuk dihapus (posisi di M["base"]),
+    nomori ulang, lalu hitung warna & catatan. Warna "duplikat" otomatis hilang kalau grupnya
+    sudah tinggal 1 baris.
+    return: (DataFrame, {pos: warna_baris}, [(pos, kolom, warna_sel)])
+    """
+    deleted = set(deleted)
+    base, meta = M["base"], M["meta"]
+    keep = [p for p in range(len(base)) if p not in deleted]
+    left = defaultdict(int)
+    for p in keep:
+        if meta[p]["dup_re"]:
+            left[meta[p]["key"]] += 1
+    main = base.iloc[keep].reset_index(drop=True)
+    main["No"] = list(range(1, len(main) + 1))
+
+    colors, cells, notes = {}, [], []
+    for pos, p in enumerate(keep):
+        m = meta[p]
+        f = set(m["flags"])
+        if m["dup_kri"] or (m["dup_re"] and left[m["key"]] >= 2):
+            f.add("dup")
+        if m["host_empty"] or m["vm_empty"]:
+            f.add("inc")
+        for key in ("ip", "hip", "dup", "inc"):          # urutan = prioritas warna baris
+            if key in f:
+                colors[pos] = COLORS[key]
+                break
+        else:
+            if m["dismantle"]:
+                colors[pos] = COLORS["dismantle"]
+            elif "new" in f:
+                colors[pos] = COLORS["new"]
+        if "ip" in f:
+            cells.append((pos, "ip_oam", CELL_COLORS["ip"]))
+        if "hip" in f:
+            cells.append((pos, "ip_oam", CELL_COLORS["hip"]))
+        if "dup" in f:
+            cells.append((pos, "Hostname", CELL_COLORS["dup"]))
+        if m["host_empty"]:
+            cells.append((pos, "Hostname", CELL_COLORS["inc"]))
+        if m["vm_empty"]:
+            cells.append((pos, "VM/Baremetal", CELL_COLORS["inc"]))
+        if m["dismantle"]:
+            cells.append((pos, "Lifecycle", CELL_COLORS["dismantle"]))
+        out = []
+        if "ip" in f:
+            out.append("Hostname beda/IP sama")
+        if "hip" in f:
+            out.append("Hostname sama/IP beda")
+        if "dup" in f:
+            out.append("Hostname duplikat")
+        if "inc" in f:
+            out.append("Hostname/VM-Baremetal kosong")
+        if m["dismantle"]:
+            out.append("Dismantle")
+        if "new" in f:
+            out.append("Baru dari KRI")
+        notes.append("; ".join(out))
+    if M["add_note"]:
+        main["Catatan"] = notes
+    return main, colors, cells
+
+
+DUP_VIEW_COLS = ["Hostname", "ip_oam", "Apps", "VM/Baremetal", "Environment", "Site", "Lifecycle"]
+
+
+def dup_rows_df(M):
+    """Baris file utama yang hostname-nya duplikat. Index = posisi baris di M["base"]."""
+    base, meta = M["base"], M["meta"]
+    pos = [p for p, m in enumerate(meta) if m["dup_re"] or m["dup_kri"]]
+    df = base.iloc[pos][["No"] + DUP_VIEW_COLS].rename(columns={"No": "No asal"}).copy()
+    df.insert(0, "Grup", [meta[p]["key"] for p in pos])
+    df.insert(1, "Sumber", ["Re-invent (duplikat)" if meta[p]["dup_re"] else "KRI duplikat (dipakai Last Update terbaru)"
+                            for p in pos])
+    return df.sort_values("Grup", kind="stable")
 
 
 # ----------------------------------------------------------------------------
@@ -516,12 +639,17 @@ def to_excel(sheets, highlights=None, cell_highlights=None):
     return buf.getvalue()
 
 
-def build_outputs(result):
-    """Bangun 2 file Excel (bytes): file utama & file laporan."""
-    main_bytes = to_excel({MAIN_SHEET: result["main"]}, {MAIN_SHEET: result["colors"]},
-                          {MAIN_SHEET: result["cells"]})
+def build_outputs(result, deleted=()):
+    """Bangun 2 file Excel (bytes): file utama & file laporan. deleted = posisi baris duplikat yang dihapus."""
+    deleted = set(deleted)
+    main, colors, cells = finalize_main(result["M"], deleted)
+    main_bytes = to_excel({MAIN_SHEET: main}, {MAIN_SHEET: colors}, {MAIN_SHEET: cells})
+    summary = result["summary"].copy()
+    summary.loc[summary["Keterangan"] == "Total baris file utama", "Jumlah"] = len(main)
+    summary.loc[len(summary)] = ("Baris duplikat dihapus (pilihan manual)", len(deleted))
+    deleted_df = result["M"]["base"].iloc[sorted(deleted)][REINVENT_COLS].copy()
     report_sheets = {
-        "Ringkasan": result["summary"],
+        "Ringkasan": summary,
         "KRI_Tidak_Ada_di_Reinvent": result["kri_only"],
         "Reinvent_Tidak_Ada_di_KRI": result["re_only"],
         "IP_Sama_Hostname_Beda": result["conf"],
@@ -529,6 +657,8 @@ def build_outputs(result):
         "Dismantle": result["dismantle"],
         "Perlu_Dilengkapi": result["incomplete"],
         "Duplikat": result["dup"],
+        "Duplikat_Dihapus": deleted_df,
+        "Hostname_Slash": result["slash"],
         "Log_Perubahan": result["log"],
     }
     return main_bytes, to_excel(report_sheets)
@@ -578,6 +708,7 @@ def sample_data():
         _kri_row(6, "srv-ipdiff", "10.10.9.9"),
         _kri_row(7, "srv-novm", "10.10.1.101", vm=""),
         _kri_row(8, "srv-app01", "10.10.1.1", **{"Last Update": "2026-05-01"}),  # duplikat (lebih lama)
+        _kri_row(9, "srv-web01 / srv-zzz", "10.10.1.3", apps="Web"),  # tanda / -> srv-web01 dipilih
     ]
     return pd.DataFrame(reinvent, columns=REINVENT_COLS), pd.DataFrame(kri, columns=KRI_COLS)
 
@@ -587,6 +718,7 @@ def sample_data():
 # ----------------------------------------------------------------------------
 DATA_DIR = Path(__file__).parent / "data"
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+P1_KEY = "p1_result"   # hasil Halaman 1 (setelah hapus duplikat) -> dipakai otomatis di Halaman 2
 
 
 def read_any(src, label, prefer_sheet=None):
@@ -1128,8 +1260,21 @@ def validation_page():
     if work is None:
         st.subheader("Langkah 1 - pilih menu dan upload file")
         menu1 = st.radio("Menu yang diproses lebih dulu", [MENU_IP, MENU_HOST], horizontal=True, key="start_menu")
-        f_prev = st.file_uploader("1) File hasil olahan sebelumnya (Reinvent_Updated.xlsx)",
-                                  type=["xlsx", "xls", "csv"], key="prev_main")
+        p1 = st.session_state.get(P1_KEY)
+        use_auto = False
+        if p1 is not None:
+            pick = st.radio(
+                "1) File hasil olahan sebelumnya",
+                [f"Otomatis dari Halaman 1 ({len(p1['df'])} baris, sudah dikurangi {p1['deleted']} duplikat)",
+                 "Upload file sendiri"], key="prev_src")
+            use_auto = pick.startswith("Otomatis")
+        else:
+            st.info("Belum ada hasil Halaman 1 di sesi ini. Proses dulu di Halaman 1 (otomatis terbawa ke sini), "
+                    "atau upload file hasil olahan sebelumnya di bawah.")
+        f_prev = None
+        if not use_auto:
+            f_prev = st.file_uploader("1) File hasil olahan sebelumnya (Reinvent_Updated.xlsx)",
+                                      type=["xlsx", "xls", "csv"], key="prev_main")
         f_val = st.file_uploader("2) " + VAL_SPECS[menu1]["label"], type=["xlsx", "xls", "csv"],
                                  key=VAL_SPECS[menu1]["key"])
         f_hist = st.file_uploader(
@@ -1137,16 +1282,21 @@ def validation_page():
             help="Hanya jika menu lain sudah dikerjakan di sesi/hari sebelumnya, supaya entri yang sudah "
                  "terselesaikan otomatis gugur.")
         go = st.button("▶️ Proses langkah 1", type="primary", key="go1",
-                       disabled=(f_prev is None or f_val is None))
+                       disabled=((not use_auto and f_prev is None) or f_val is None))
         if not go:
-            st.info("Upload file hasil olahan sebelumnya dan file validasi menu terpilih, lalu klik **Proses langkah 1**.")
+            st.info("Upload file validasi menu terpilih" + ("" if use_auto else " dan file hasil olahan sebelumnya")
+                    + ", lalu klik **Proses langkah 1**.")
             return
 
-        try:
-            prev_df, prev_fills, miss = read_prev_main(f_prev)
-        except Exception as e:
-            st.error(f"Gagal membaca file hasil sebelumnya: {e}")
-            return
+        if use_auto:
+            prev_df, miss = standardize(p1["df"], REINVENT_COLS, REINVENT_ALIASES)
+            prev_fills = {k: dict(v) for k, v in p1["fills"].items()}
+        else:
+            try:
+                prev_df, prev_fills, miss = read_prev_main(f_prev)
+            except Exception as e:
+                st.error(f"Gagal membaca file hasil sebelumnya: {e}")
+                return
         if "Hostname" in miss:
             st.error("Kolom Hostname tidak ditemukan di file hasil sebelumnya.")
             return
@@ -1463,6 +1613,41 @@ def baremetal_page():
             st.dataframe(df, hide_index=True)
 
 
+def dup_selection_ui(R):
+    """Tampilkan baris duplikat dengan kotak centang 'Hapus'. Return: set posisi baris yang dihapus."""
+    dups = dup_rows_df(R["M"])
+    if dups.empty:
+        return set()
+    st.subheader("🗑️ Duplikat hostname - pilih yang dihapus")
+    st.caption(f"{len(dups)} baris dalam {dups['Grup'].nunique()} grup hostname duplikat. Centang **Hapus** pada baris "
+               "yang mau dibuang; file Excel di bawah baru dibuat setelah baris yang dicentang dikeluarkan.")
+    modes = ["Manual (belum ada yang dicentang)", "Hapus semua kecuali baris pertama tiap grup",
+             "Hapus semua kecuali baris terakhir tiap grup"]
+    mode = st.radio("Centang awal", modes, horizontal=True, key="dup_mode")
+    view = dups.copy()
+    if mode == modes[1]:
+        init = view["Grup"].duplicated(keep="first")
+    elif mode == modes[2]:
+        init = view["Grup"].duplicated(keep="last")
+    else:
+        init = pd.Series(False, index=view.index)
+    view.insert(0, "Hapus", init.values)
+    sig = hashlib.md5("|".join(f"{i}:{h}" for i, h in zip(view.index, view["Hostname"])).encode()).hexdigest()[:8]
+    edited = st.data_editor(
+        view, hide_index=True, key=f"dup_ed_{sig}_{modes.index(mode)}",
+        column_config={"Hapus": st.column_config.CheckboxColumn("Hapus", help="Centang = baris dibuang dari file utama")},
+        disabled=[c for c in view.columns if c != "Hapus"],
+    )
+    deleted = set(edited.index[edited["Hapus"].astype(bool)])
+    emptied = [g for g, d in edited.groupby("Grup") if d["Hapus"].all()]
+    if emptied:
+        st.warning("Semua baris untuk hostname ini ikut dihapus (hostname hilang dari file): " + ", ".join(emptied[:10])
+                   + (" ..." if len(emptied) > 10 else ""))
+    st.info(f"{len(deleted)} baris dipilih untuk dihapus → file utama menjadi "
+            f"{len(R['M']['base']) - len(deleted)} baris.")
+    return deleted
+
+
 def main():
     st.set_page_config(page_title="Re-invent vs KRI", page_icon="🔍", layout="wide")
 
@@ -1553,7 +1738,6 @@ def main():
     opts = dict(strategy=strategy, reinvent_date=reinvent_date, sync=sync, dismantle_kw=dismantle_kw,
                 remark_cols=remark_cols, add_note=add_note, split_incomplete=split_incomplete)
     R = compute(re_df, kri_df, opts)
-    main_bytes, report_bytes = build_outputs(R)
 
     s = dict(zip(R["summary"]["Keterangan"], R["summary"]["Jumlah"]))
     c = st.columns(5)
@@ -1573,6 +1757,18 @@ def main():
                 "<small>Seluruh baris diwarnai sesuai masalah utama, sel yang bermasalah (ip_oam / Hostname / "
                 "VM-Baremetal / Lifecycle) diwarnai lebih pekat.</small>", unsafe_allow_html=True)
 
+    deleted = dup_selection_ui(R)
+    main_bytes, report_bytes = build_outputs(R, deleted)
+
+    # simpan hasil (setelah hapus duplikat) -> Halaman 2 otomatis memakainya, tidak perlu upload ulang
+    final_main, f_colors, f_cells = finalize_main(R["M"], deleted)
+    fills = {pos: ({c: f_colors[pos] for c in REINVENT_COLS} if pos in f_colors else {})
+             for pos in range(len(final_main))}
+    for pos, col, color in f_cells:
+        fills[pos][col] = color
+    st.session_state[P1_KEY] = dict(df=final_main[REINVENT_COLS].copy(), fills=fills, deleted=len(deleted))
+    st.success(f"✅ Hasil ini ({len(final_main)} baris) otomatis dipakai di Halaman 2 - tidak perlu upload ulang.")
+
     d1, d2 = st.columns(2)
     d1.download_button("⬇️ Download FILE UTAMA (format Re-invent)", main_bytes, "Reinvent_Updated.xlsx",
                        XLSX, type="primary")
@@ -1588,13 +1784,15 @@ def main():
 
     tabs = st.tabs(["File utama", "KRI tidak ada di Re-invent", "Re-invent tidak ada di KRI",
                     "IP sama, hostname beda", "Hostname sama, IP beda", "Dismantle",
-                    "Perlu dilengkapi", "Duplikat", "Log perubahan"])
+                    "Perlu dilengkapi", "Duplikat", "Log perubahan", "Hostname bertanda /"])
     frames = [R["main"], R["kri_only"], R["re_only"], R["conf"], R["hip"], R["dismantle"],
-              R["incomplete"], R["dup"], R["log"]]
+              R["incomplete"], R["dup"], R["log"], R["slash"]]
     hints = {3: "Isi kolom **Validasi Final Hostname** di sheet `IP_Sama_Hostname_Beda` (file laporan), "
                 "lalu upload di halaman 2 (Terapkan validasi).",
              4: "Isi kolom **Validasi IP_OAM** di sheet `Hostname_Sama_IP_Beda` (file laporan), "
-                "lalu upload di halaman 2 (Terapkan validasi)."}
+                "lalu upload di halaman 2 (Terapkan validasi).",
+             9: "Hostname berisi dua nilai (xxx / xxxx): bagian yang cocok dengan file lawan dipertahankan, "
+                "bagian lain dihapus. Status 'Belum terselesaikan' / 'Perlu dicek' sebaiknya dicek manual."}
     for n, (tab, df) in enumerate(zip(tabs, frames)):
         with tab:
             if n in hints:
