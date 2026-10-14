@@ -1360,10 +1360,10 @@ def validation_page():
 #
 # Alur: baris Re-invent (boleh Reinvent_Updated.xlsx hasil halaman 1/2) dicocokkan ke inventory
 # baremetal lewat IP OAM / IP Service. HASIL = file format Re-invent (kolom persis Re-invent).
-#   - Hostname, Serial Numbers, Hardware Model, OS Product diisi dari inventory baremetal
+#   - Hostname, App PIC Email (PIC APPS), Environment (Prod/Nonprod), Platform (Brand), Serial Numbers,
+#     Site, rack, floor, Hardware Model, OS Product diisi dari inventory baremetal
 #   - kolom "Status" di baremetal -> "Power State" Re-invent (hanya ON / OFF)
-#   - Apps, Priority, PIC, Environment, VM/Baremetal, Site/Rack/Floor, Ansible / NGPAM / XDR
-#     dan kolom lain TETAP dari Re-invent (tidak diambil dari baremetal)
+#   - Apps, Priority, VM/Baremetal, Ansible / NGPAM / XDR dan kolom lain TETAP dari Re-invent
 # ----------------------------------------------------------------------------
 BM_COLS = [
     "No", "Apps", "PIC APPS", "Priority", "Prod/Nonprod", "Brand", "Hardware Type", "EOS Hardware",
@@ -1378,12 +1378,18 @@ BM_ALIASES = {"IP Service": "IP Services", "PIC Apps": "PIC APPS", "Serial Numbe
 # kolom inventory baremetal -> kolom Re-invent (nilai baremetal MENIMPA Re-invent jika terisi)
 BM_TO_RE = {
     "Hostname OS": "Hostname",
+    "PIC APPS": "App PIC Email",
+    "Prod/Nonprod": "Environment",
+    "Brand": "Platform",
     "Serial Number": "Serial Numbers",
+    "Site": "Site",
+    "Rack": "rack",
+    "Floor": "floor",
     "Hardware Type": "Hardware Model",
     "Operating System": "OS Product",
     "Status": "Power State",
 }
-BM_TO_RE_OPTIONAL = {"Brand": "Platform"}   # tidak dipakai kecuali dicentang di sidebar
+BM_TO_RE_OPTIONAL = {}   # kolom tambahan opsional (kosong)
 BM_TO_RE_ALL = {**BM_TO_RE, **BM_TO_RE_OPTIONAL}
 
 BM_ROW = {"multi": "E4DFEC", "re_only": "FCE4D6"}
@@ -1574,7 +1580,8 @@ def sample_baremetal():
     def r(no, host, oam, svc="", **kw):
         d = {c: "" for c in BM_COLS}
         d.update({"No": no, "Hostname OS": host, "IP OAM": oam, "IP Services": svc, "Apps": "Apps-Lama",
-                  "Serial Number": f"SN-{no:04d}", "Hardware Type": "Dell R750", "Operating System": "RHEL 8",
+                  "Serial Number": f"SN-{no:04d}", "PIC APPS": "pic.baru@telkomsel.co.id", "Prod/Nonprod": "Production",
+                  "Brand": "Dell", "Site": "DC-2", "Rack": "R09", "Floor": "2", "Hardware Type": "Dell R750", "Operating System": "RHEL 8",
                   "Status": "Power On", "Ansible": "Integrated"})
         d.update(kw)
         return d
@@ -1605,14 +1612,15 @@ def sample_reinvent_bm():
 def baremetal_page():
     st.title("🖥️ Bandingkan dengan Inventory Baremetal")
     st.caption("Re-invent dicocokkan ke inventory baremetal lewat IP OAM / IP Service. Hasilnya tetap format Re-invent: "
-               "Hostname, Serial Numbers, dll diambil dari baremetal, Status baremetal → Power State (ON/OFF). "
-               "Apps, Priority, PIC, Environment, VM/Baremetal, Site/Rack/Floor, Ansible/NGPAM/XDR tetap dari Re-invent.")
+               "Hostname, PIC, Environment, Platform, Serial Numbers, Site/Rack/Floor, dll diambil dari baremetal, "
+               "Status baremetal → Power State (ON/OFF). Apps, Priority, VM/Baremetal, Ansible/NGPAM/XDR tetap dari Re-invent.")
     use_dummy = st.sidebar.checkbox("Pakai data contoh (dummy)", value=False, key="bm_dummy")
     take = st.sidebar.multiselect(
         "Kolom Re-invent yang diisi dari baremetal",
         list(BM_TO_RE.values()) + list(BM_TO_RE_OPTIONAL.values()), default=list(BM_TO_RE.values()),
-        help="Default: Hostname (Hostname OS), Serial Numbers, Hardware Model (Hardware Type), OS Product "
-             "(Operating System), Power State (Status). Platform (dari Brand) opsional.", key="bm_take")
+        help="Default semua kolom: Hostname, App PIC Email, Environment, Platform, Serial Numbers, Site, rack, "
+             "floor, Hardware Model, OS Product, Power State. Hapus centang untuk kolom yang tidak mau ditimpa.",
+        key="bm_take")
     p1 = st.session_state.get(P1_KEY)
     if use_dummy:
         f_bm, f_re = sample_baremetal(), sample_reinvent_bm()
