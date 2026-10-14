@@ -1205,12 +1205,274 @@ def validation_page():
         st.rerun()
 
 
+# ----------------------------------------------------------------------------
+# MENU 3: BANDINGKAN DENGAN INVENTORY BAREMETAL
+#
+# Alur: Inventory baremetal (file baru) dicocokkan ke data Re-invent (boleh Reinvent_Updated.xlsx
+# hasil halaman 1/2) lewat IP OAM / IP Service. Isi kolom di inventory baremetal lalu DISAMAKAN
+# dengan Re-invent (hostname, apps, priority, PIC, environment, site/rack/floor, status Ansible,
+# NGPAM, XDR, dll). Nilai dari file baremetal tidak dipakai untuk kolom-kolom tersebut.
+# ----------------------------------------------------------------------------
+BM_COLS = [
+    "No", "Apps", "PIC APPS", "Priority", "Prod/Nonprod", "Brand", "Hardware Type", "EOS Hardware",
+    "Serial Number", "Site", "Rack", "Floor", "Hostname MGMT", "Hostname OS", "IP OAM", "IP Services",
+    "IP MGMT", "User MGMT", "Password MGMT", "Method access OS", "User OS", "Password OS", "EOS OS",
+    "Operating System", "CPU (Core)", "Memory (GB)", "Status", "Scope", "Environment", "Server Type",
+    "Zabbix", "Dynatrace", "Ansible", "Notes OS", "Notes MGMT", "Remark Hardware Faulty",
+    "CRQ number Dismantle / Poweroff", "Kolom1", "Kolom12", "Telnet & ping",
+]
+BM_ALIASES = {"IP Service": "IP Services", "PIC Apps": "PIC APPS", "Serial Numbers": "Serial Number"}
+
+# kolom tambahan di sisi kanan (diisi dari Re-invent)
+BM_EXTRA = ["VM/Baremetal", "NGPAM Status", "XDR Status", "Lifecycle", "Match By", "Catatan Perbandingan"]
+
+# kolom inventory baremetal -> kolom Re-invent. Nilai Re-invent MENIMPA nilai baremetal (jika Re-invent terisi)
+BM_FOLLOW = {
+    "Hostname OS": "Hostname", "Apps": "Apps", "PIC APPS": "App PIC Email", "Priority": "Apps Priority",
+    "Prod/Nonprod": "Environment", "Site": "Site", "Rack": "rack", "Floor": "floor",
+    "IP OAM": "ip_oam", "IP Services": "ip_service", "Ansible": "Ansible Status",
+}
+# kolom yang hanya diisi dari Re-invent jika di baremetal kosong
+BM_FILL = {"Hardware Type": "Hardware Model", "Serial Number": "Serial Numbers", "Operating System": "OS Product"}
+# kolom tambahan: selalu ikut Re-invent (termasuk jika kosong) untuk baris yang cocok
+BM_EXTRA_FROM_RE = {"VM/Baremetal": "VM/Baremetal", "NGPAM Status": "NGPAM Status",
+                    "XDR Status": "XDR Status", "Lifecycle": "Lifecycle"}
+BM_STATUS = {"Ansible", "NGPAM Status", "XDR Status"}
+
+BM_ROW = {"multi": "E4DFEC", "nomatch": "FCE4D6", "hostdiff": "FFF2CC", "dismantle": "D9D9D9"}
+BM_CHANGED = "C6E0B4"   # sel yang nilainya berubah mengikuti Re-invent
+BM_MATCH_LABEL = {0: "IP OAM", 1: "IP OAM baremetal = IP Service Re-invent",
+                  2: "IP Service", 3: "IP Service baremetal = IP OAM Re-invent"}
+
+
+def compare_baremetal(bm_df, re_df):
+    """
+    bm_df : inventory baremetal (sudah standardize(BM_COLS))
+    re_df : Re-invent (sudah standardize(REINVENT_COLS))
+    """
+    bm = bm_df.copy().reset_index(drop=True)
+    re_df = re_df.copy().reset_index(drop=True)
+    for col in STATUS_COLS:
+        re_df[col] = re_df[col].map(norm_status)
+    re_df["_key"] = re_df["Hostname"].map(host_key)
+
+    re_ip = defaultdict(list)          # ip -> [(idx, "oam"/"svc")]
+    for i, r in re_df.iterrows():
+        for ip in ip_set(r["ip_oam"]):
+            re_ip[ip].append((i, "oam"))
+        for ip in ip_set(r["ip_service"]):
+            re_ip[ip].append((i, "svc"))
+
+    for c in BM_EXTRA:
+        bm[c] = ""
+    log, changed_cells, row_flags = [], [], {}
+    nomatch, multi, hostdiff = [], [], []
+    matched_re = set()
+
+    for pos, row in bm.iterrows():
+        oam, svc = ip_set(row["IP OAM"]), ip_set(row["IP Services"])
+        score = {}   # idx re-invent -> skor terbaik (kecil = lebih kuat)
+        for ip in oam:
+            for i, kind in re_ip.get(ip, []):
+                score[i] = min(score.get(i, 9), 0 if kind == "oam" else 1)
+        for ip in svc:
+            for i, kind in re_ip.get(ip, []):
+                score[i] = min(score.get(i, 9), 2 if kind == "svc" else 3)
+        flags = set()
+        if not score:
+            nomatch.append(pos)
+            bm.at[pos, "Catatan Perbandingan"] = "Tidak ditemukan di Re-invent (IP OAM / IP Service)"
+            row_flags[pos] = {"nomatch"}
+            continue
+
+        best = min(score.values())
+        cands = [i for i, s in score.items() if s == best]
+        notes = []
+        if len(cands) > 1:
+            same_host = [i for i in cands if re_df.at[i, "_key"] == host_key(row["Hostname OS"])]
+            pick = same_host[0] if same_host else cands[0]
+            flags.add("multi")
+            notes.append("Cocok ke " + str(len(cands)) + " baris Re-invent (" +
+                         ", ".join(re_df.at[i, "Hostname"] or "-" for i in cands) + "); dipakai: " +
+                         (re_df.at[pick, "Hostname"] or "-"))
+            multi.append({"Hostname OS baremetal": row["Hostname OS"], "IP OAM baremetal": row["IP OAM"],
+                          "Kandidat Re-invent": ", ".join(re_df.at[i, "Hostname"] or "-" for i in cands),
+                          "Dipakai": re_df.at[pick, "Hostname"]})
+        else:
+            pick = cands[0]
+        matched_re.add(pick)
+        rr = re_df.loc[pick]
+        bm.at[pos, "Match By"] = BM_MATCH_LABEL[best]
+
+        # --- kolom yang mengikuti Re-invent -----------------------------------
+        for bcol, rcol in BM_FOLLOW.items():
+            new = rr[rcol]
+            if bcol in BM_STATUS:
+                new = norm_status(new)
+            if not new:        # Re-invent kosong -> nilai lama dibiarkan
+                continue
+            if new.casefold() != row[bcol].casefold():
+                bm.at[pos, bcol] = new
+                changed_cells.append((pos, bcol, BM_CHANGED))
+                log.append({"Hostname OS": rr["Hostname"], "IP OAM": rr["ip_oam"], "Field": bcol,
+                            "Nilai inventory baremetal (lama)": row[bcol], "Nilai baru (Re-invent)": new})
+        # --- kolom yang hanya diisi jika kosong -------------------------------
+        for bcol, rcol in BM_FILL.items():
+            if not row[bcol] and rr[rcol]:
+                bm.at[pos, bcol] = rr[rcol]
+                changed_cells.append((pos, bcol, BM_CHANGED))
+                log.append({"Hostname OS": rr["Hostname"], "IP OAM": rr["ip_oam"], "Field": bcol,
+                            "Nilai inventory baremetal (lama)": "", "Nilai baru (Re-invent)": rr[rcol]})
+        # --- kolom tambahan ----------------------------------------------------
+        for bcol, rcol in BM_EXTRA_FROM_RE.items():
+            bm.at[pos, bcol] = rr[rcol]
+        for bcol in ("NGPAM Status", "XDR Status"):
+            changed_cells.append((pos, bcol, BM_CHANGED))
+
+        # --- catatan ------------------------------------------------------------
+        old_host = row["Hostname OS"]
+        if old_host and rr["Hostname"] and host_key(old_host) != host_key(rr["Hostname"]):
+            flags.add("hostdiff")
+            notes.append(f"Hostname OS berbeda: baremetal '{old_host}' -> Re-invent '{rr['Hostname']}'")
+            hostdiff.append({"IP OAM": row["IP OAM"], "Hostname OS baremetal": old_host,
+                             "Hostname Re-invent": rr["Hostname"], "Match By": BM_MATCH_LABEL[best]})
+        if rr["VM/Baremetal"] and "bare" not in rr["VM/Baremetal"].lower():
+            notes.append(f"Di Re-invent tercatat {rr['VM/Baremetal']} (bukan Baremetal)")
+        if rr["Lifecycle"].lower() == "dismantle":
+            flags.add("dismantle")
+            notes.append("Lifecycle Re-invent = dismantle")
+        if best >= 1:
+            notes.append("Match lewat " + BM_MATCH_LABEL[best])
+        bm.at[pos, "Catatan Perbandingan"] = "; ".join(notes)
+        row_flags[pos] = flags
+
+    bm["No"] = list(range(1, len(bm) + 1))
+    colors = {}
+    for pos, f in row_flags.items():
+        for key in ("multi", "nomatch", "hostdiff", "dismantle"):
+            if key in f:
+                colors[pos] = BM_ROW[key]
+                break
+
+    # Re-invent baremetal yang belum ada di inventory baremetal
+    is_bare = re_df["VM/Baremetal"].str.lower().str.contains("bare", na=False)
+    re_only = re_df[is_bare & ~re_df.index.isin(matched_re)][REINVENT_COLS].copy()
+    nomatch_df = bm.loc[nomatch, BM_COLS + BM_EXTRA].copy()
+    log_df = pd.DataFrame(log, columns=["Hostname OS", "IP OAM", "Field", "Nilai inventory baremetal (lama)",
+                                        "Nilai baru (Re-invent)"])
+    host_df = pd.DataFrame(hostdiff, columns=["IP OAM", "Hostname OS baremetal", "Hostname Re-invent", "Match By"])
+    multi_df = pd.DataFrame(multi, columns=["Hostname OS baremetal", "IP OAM baremetal", "Kandidat Re-invent", "Dipakai"])
+    summary = pd.DataFrame([
+        ("Total baris inventory baremetal", len(bm)),
+        ("Total baris Re-invent", len(re_df)),
+        ("Baremetal yang cocok dengan Re-invent", len(bm) - len(nomatch)),
+        ("Baremetal TIDAK ada di Re-invent", len(nomatch)),
+        ("Re-invent (Baremetal) TIDAK ada di inventory baremetal", len(re_only)),
+        ("Hostname OS berbeda (ditimpa Re-invent)", len(host_df)),
+        ("Cocok ke lebih dari 1 baris Re-invent", len(multi_df)),
+        ("Jumlah perubahan nilai", len(log_df)),
+    ], columns=["Keterangan", "Jumlah"])
+    return dict(main=bm[BM_COLS + BM_EXTRA], colors=colors, cells=changed_cells, nomatch=nomatch_df,
+                re_only=re_only, hostdiff=host_df, multi=multi_df, log=log_df, summary=summary)
+
+
+def build_baremetal_outputs(R):
+    main = to_excel({"Baremetal_Updated": R["main"]}, {"Baremetal_Updated": R["colors"]},
+                    {"Baremetal_Updated": R["cells"]})
+    report = to_excel({
+        "Ringkasan": R["summary"],
+        "Baremetal_Tidak_Ada_di_Reinvent": R["nomatch"],
+        "Reinvent_Tidak_Ada_di_Baremetal": R["re_only"],
+        "Hostname_Beda": R["hostdiff"],
+        "Multi_Match": R["multi"],
+        "Log_Perubahan": R["log"],
+    })
+    return main, report
+
+
+def sample_baremetal():
+    def r(no, host, oam, svc="", apps="Lama", **kw):
+        d = {c: "" for c in BM_COLS}
+        d.update({"No": no, "Hostname OS": host, "IP OAM": oam, "IP Services": svc, "Apps": apps,
+                  "Priority": "P3", "Site": "OLD-SITE"})
+        d.update(kw)
+        return d
+    rows = [r(1, "srv-app01", "10.10.1.1"), r(2, "srv-db01-old", "10.10.1.2"),
+            r(3, "srv-lonely", "10.10.77.7"), r(4, "srv-svc", "", "10.20.0.5")]
+    return pd.DataFrame(rows, columns=BM_COLS)
+
+
+def baremetal_page():
+    st.title("🖥️ Bandingkan dengan Inventory Baremetal")
+    st.caption("Inventory baremetal dicocokkan ke Re-invent lewat IP OAM / IP Service. Hostname, Apps, Priority, "
+               "PIC, Environment, Site/Rack/Floor, status Ansible/NGPAM/XDR, dll mengikuti data Re-invent.")
+    use_dummy = st.sidebar.checkbox("Pakai data contoh (dummy)", value=False, key="bm_dummy")
+    if use_dummy:
+        f_bm = sample_baremetal()
+        f_re, _ = sample_data()
+        f_re = f_re.copy()
+        f_re["ip_service"] = ["", "", "", "", "", "", ""]
+        f_re.loc[2, "ip_service"] = "10.20.0.5"
+        f_re["VM/Baremetal"] = "Baremetal"
+        f_re["Hardware Model"] = "Dell R740"
+        f_re["App PIC Email"] = "pic@telkomsel.co.id"
+    else:
+        f_bm = st.file_uploader("1) Inventory baremetal (file baru)", type=["xlsx", "xls", "csv"], key="bm_file")
+        f_re = st.file_uploader("2) Data Re-invent (boleh Reinvent_Updated.xlsx hasil halaman 1/2)",
+                                type=["xlsx", "xls", "csv"], key="bm_re")
+    if f_bm is None or f_re is None:
+        st.info("Upload inventory baremetal dan data Re-invent, atau centang *Pakai data contoh* di sidebar.")
+        return
+    try:
+        bm_df, miss_bm = standardize(read_any(f_bm, "Baremetal"), BM_COLS, BM_ALIASES)
+        re_df, miss_re = standardize(read_any(f_re, "Re-invent (baremetal)"), REINVENT_COLS, REINVENT_ALIASES)
+    except Exception as e:
+        st.error(f"Gagal membaca file: {e}")
+        return
+    if miss_bm:
+        st.warning(f"Kolom tidak ditemukan di inventory baremetal (dikosongkan): {', '.join(miss_bm)}")
+    if miss_re:
+        st.warning(f"Kolom tidak ditemukan di Re-invent (dikosongkan): {', '.join(miss_re)}")
+    if all(c in miss_bm for c in ("IP OAM", "IP Services")):
+        st.error("Inventory baremetal harus punya kolom IP OAM atau IP Services.")
+        return
+
+    R = compare_baremetal(bm_df, re_df)
+    main_bytes, report_bytes = build_baremetal_outputs(R)
+    s = dict(zip(R["summary"]["Keterangan"], R["summary"]["Jumlah"]))
+    c = st.columns(4)
+    c[0].metric("Baremetal", s["Total baris inventory baremetal"])
+    c[1].metric("Cocok dgn Re-invent", s["Baremetal yang cocok dengan Re-invent"])
+    c[2].metric("Tidak ada di Re-invent", s["Baremetal TIDAK ada di Re-invent"])
+    c[3].metric("Re-invent tdk ada di baremetal", s["Re-invent (Baremetal) TIDAK ada di inventory baremetal"])
+    c = st.columns(3)
+    c[0].metric("Hostname beda", s["Hostname OS berbeda (ditimpa Re-invent)"])
+    c[1].metric("Multi match", s["Cocok ke lebih dari 1 baris Re-invent"])
+    c[2].metric("Perubahan nilai", s["Jumlah perubahan nilai"])
+    st.markdown("**Warna:** 🟩 sel diubah mengikuti Re-invent · 🟨 hostname berbeda · 🟪 cocok ke >1 baris Re-invent · "
+                "🟧 tidak ada di Re-invent · ⬜ dismantle")
+    d1, d2 = st.columns(2)
+    d1.download_button("⬇️ Download INVENTORY BAREMETAL (sudah disesuaikan)", main_bytes, "Baremetal_Updated.xlsx",
+                       XLSX, type="primary")
+    d2.download_button("⬇️ Download LAPORAN PERBANDINGAN", report_bytes, "Laporan_Baremetal.xlsx", XLSX)
+    tabs = st.tabs(["Inventory hasil", "Baremetal tidak ada di Re-invent", "Re-invent tidak ada di baremetal",
+                    "Hostname beda", "Multi match", "Log perubahan"])
+    for tab, df in zip(tabs, [R["main"], R["nomatch"], R["re_only"], R["hostdiff"], R["multi"], R["log"]]):
+        with tab:
+            st.write(f"{len(df)} baris")
+            st.dataframe(df, hide_index=True)
+
+
 def main():
     st.set_page_config(page_title="Re-invent vs KRI", page_icon="🔍", layout="wide")
 
-    page = st.sidebar.radio("Halaman", ["1. Bandingkan data", "2. Terapkan validasi (perbaikan)"])
+    page = st.sidebar.radio("Halaman", ["1. Bandingkan data", "2. Terapkan validasi (perbaikan)",
+                                        "3. Bandingkan dengan inventory baremetal"])
     if page.startswith("2"):
         validation_page()
+        return
+    if page.startswith("3"):
+        baremetal_page()
         return
 
     with st.sidebar:
