@@ -614,6 +614,14 @@ def find_file(folder, keyword):
 
 # ----------------------------------------------------------------------------
 # MENU 2: TERAPKAN VALIDASI (PERBAIKAN) DARI FILE EXCEL HASIL VALIDASI
+#
+# Kedua menu saling berkorelasi:
+#   - Jika baris sudah dihapus / hostname sudah diganti lewat validasi "IP sama, hostname beda",
+#     maka entri "Hostname sama, IP beda" untuk hostname itu otomatis GUGUR (tidak diproses, tidak ditandai).
+#   - Jika IP sudah diganti lewat validasi "Hostname sama, IP beda" sehingga konflik IP sudah tidak ada,
+#     maka entri "IP sama, hostname beda" untuk IP itu otomatis GUGUR.
+#   Berlaku dua arah, baik dalam satu sesi (urutan bisa dipilih) maupun lintas sesi
+#   (upload Laporan_Validasi.xlsx sebelumnya sebagai riwayat).
 # ----------------------------------------------------------------------------
 MENU_IP = "IP sama, hostname beda"
 MENU_HOST = "Hostname sama, IP beda"
@@ -629,6 +637,7 @@ VAL_HOST_COLS = ["Hostname Re-invent", "Hostname KRI", "ip_oam Re-invent", "IP O
 VAL_HOST_ALIASES = {"VM/Baremeteal Re-invent": "VM/Baremetal Re-invent",
                     "VM/Baremeteal KRI": "VM/Baremetal KRI",
                     "Validasi IP": "Validasi IP_OAM", "Validasi OAM": "Validasi IP_OAM"}
+LOG_COLS = ["Menu", "Hostname", "Field", "Nilai lama", "Nilai baru", "Keterangan"]
 
 # warna penanda "validasi masih kosong / belum divalidasi"
 MARK_ROW = "FFC7CE"
@@ -684,12 +693,37 @@ def read_prev_main(src):
     return df, fills, missing
 
 
-def _new_state(df, fills):
+def read_history(src):
+    """
+    Riwayat validasi sebelumnya dari Laporan_Validasi.xlsx (sheet Log_Perubahan):
+      gone    : {kunci hostname: alasan}  untuk baris yang sudah dihapus / hostname yang sudah diganti
+      ip_hist : {kunci hostname: {IP lama}} untuk IP yang sudah diganti
+    """
+    df = pd.read_excel(src, sheet_name="Log_Perubahan", dtype=str)
+    df, _ = standardize(df, LOG_COLS, {})
+    gone, ip_hist = {}, defaultdict(set)
+    for _, r in df.iterrows():
+        f = r["Field"]
+        if f == "(baris dihapus)":
+            gone[host_key(r["Hostname"])] = f"sudah dihapus lewat validasi sebelumnya ({r['Menu']})"
+        elif f == "Hostname" and host_key(r["Nilai lama"]) != host_key(r["Nilai baru"]):
+            gone[host_key(r["Nilai lama"])] = f"sudah diganti menjadi {r['Nilai baru']} lewat validasi sebelumnya"
+        elif f == "ip_oam":
+            ip_hist[host_key(r["Hostname"])] |= ip_set(r["Nilai lama"]) - ip_set(r["Nilai baru"])
+    return dict(gone=gone, ip_hist=ip_hist)
+
+
+def _new_state(df, fills, history=None):
     df = df.copy()
     df["_key"] = df["Hostname"].map(host_key)
-    df["_ips"] = df["ip_oam"].map(ip_set)
-    return dict(df=df, fills=dict(fills), marks={}, marked=[], deleted=set(),
-                log=[], notfound=[], warns=[])
+    S = dict(df=df, fills=dict(fills), ips={i: ip_set(v) for i, v in df["ip_oam"].items()},
+             marks={}, deleted=set(), gone={}, ip_hist=defaultdict(set), new_ips={},
+             log=[], notfound=[], gugur=[], warns=[])
+    if history:
+        S["gone"].update(history["gone"])
+        for k, v in history["ip_hist"].items():
+            S["ip_hist"][k] |= v
+    return S
 
 
 def _log(S, menu, host, field, old, new, ket=""):
@@ -697,13 +731,22 @@ def _log(S, menu, host, field, old, new, ket=""):
                      "Nilai lama": old, "Nilai baru": new, "Keterangan": ket})
 
 
-def _mark(S, idx, reason, col, menu):
+def _gugur(S, menu, ip, host, reason):
+    S["gugur"].append({"Menu": menu, "IP": ip, "Hostname": host, "Alasan": reason})
+
+
+def _mark(S, idx, reason, col, menu, kind, ip="", keys=()):
+    """Tandai baris (merah muda). kind: 'ip' = konflik IP sama; 'hostip' = hostname sama IP beda."""
     if idx in S["marks"]:
         return
-    S["marks"][idx] = (reason, col)
-    S["fills"].pop(idx, None)
-    S["marked"].append({"Menu": menu, "Hostname": S["df"].at[idx, "Hostname"],
-                        "ip_oam": S["df"].at[idx, "ip_oam"], "Alasan": reason})
+    S["marks"][idx] = dict(reason=reason, col=col, menu=menu, kind=kind, ip=ip, keys=set(keys),
+                           host=S["df"].at[idx, "Hostname"], fills=S["fills"].pop(idx, {}))
+
+
+def _unmark(S, idx, remove):
+    m = S["marks"].pop(idx, None)
+    if m:
+        S["fills"][idx] = {k: v for k, v in m["fills"].items() if v not in remove}
 
 
 def _strip(S, idx, remove):
@@ -734,16 +777,17 @@ def _fill_vm(S, idx, options, menu):
 def apply_ip_validation(S, val):
     """
     IP sama, hostname beda.
-    Untuk tiap IP: baris-baris yang bentrok di file sebelumnya dihapus lalu diganti SATU baris
-    dengan Hostname = 'Validasi Final Hostname'. Jika validasi kosong -> baris ditandai.
+    Baris yang bentrok dihapus dan diganti SATU baris berhostname 'Validasi Final Hostname'.
+    Validasi kosong -> ditandai. Konflik yang sudah tidak ada (mis. IP sudah diganti lewat menu
+    'Hostname sama, IP beda') -> entri GUGUR.
     """
     menu = MENU_IP
     df = S["df"]
     flagged = {i for i, f in S["fills"].items() if set(f.values()) & IP_FILLS}  # bentrok dari hasil lama
 
     ip_idx = defaultdict(list)
-    for i, ips in zip(df.index, df["_ips"]):
-        for ip in ips:
+    for i in df.index:
+        for ip in S["ips"].get(i, ()):
             ip_idx[ip].append(i)
 
     groups = {}
@@ -763,17 +807,41 @@ def apply_ip_validation(S, val):
             keys |= {host_key(r["Hostname Re-invent"]), host_key(r["Hostname KRI"])}
         keys.discard("")
         re_keys = {host_key(r["Hostname Re-invent"]) for r in rows} - {""}
-        names = " | ".join(sorted({clean(r[c]) for r in rows for c in ("Hostname Re-invent", "Hostname KRI") if clean(r[c])}))
+        names = " | ".join(sorted({clean(r[c]) for r in rows for c in ("Hostname Re-invent", "Hostname KRI")
+                                   if clean(r[c])}))
         cand = [i for i in ip_idx.get(ip, []) if i not in S["deleted"] and df.at[i, "_key"] in keys]
+        distinct = {df.at[i, "_key"] for i in cand}
+        hist_keys = sorted(k for k in keys if ip in S["ip_hist"].get(k, set()))
+        gone_keys = [k for k in sorted(keys) if k in S["gone"]]
+
         if not cand:
-            S["notfound"].append({"Menu": menu, "IP": ip, "Hostname": names,
-                                  "Alasan": "IP + hostname tidak ditemukan di file hasil sebelumnya"})
+            if hist_keys:
+                _gugur(S, menu, ip, names, f"GUGUR: IP hostname {', '.join(hist_keys)} sudah diganti lewat validasi "
+                       f"{MENU_HOST}")
+            elif gone_keys:
+                _gugur(S, menu, ip, names, f"GUGUR: hostname {gone_keys[0]} {S['gone'][gone_keys[0]]}")
+            else:
+                S["notfound"].append({"Menu": menu, "IP": ip, "Hostname": names,
+                                      "Alasan": "IP + hostname tidak ditemukan di file hasil sebelumnya "
+                                                "(salah ketik, atau sudah diselesaikan - upload Laporan_Validasi "
+                                                "sebelumnya sebagai riwayat)"})
+            continue
+
+        if len(distinct) < 2:   # hanya satu hostname yang masih memakai IP ini -> konflik sudah tidak ada
+            if hist_keys:
+                why = f"IP hostname {', '.join(hist_keys)} sudah diganti lewat validasi {MENU_HOST}"
+            else:
+                why = "konflik sudah tidak ada di file (hanya satu hostname yang memakai IP ini)"
+            _gugur(S, menu, ip, names, f"GUGUR: {why}")
+            for i in cand:
+                _strip(S, i, IP_FILLS)
+                _complete_cleanup(S, i)
             continue
 
         finals = [clean(r["Validasi Final Hostname"]) for r in rows if clean(r["Validasi Final Hostname"])]
         if not finals:
             for i in cand:
-                _mark(S, i, "Validasi Final Hostname masih kosong", "Hostname", menu)
+                _mark(S, i, "Validasi Final Hostname masih kosong", "Hostname", menu, "ip", ip, distinct)
             continue
         final = finals[0]
         fk = host_key(final)
@@ -793,17 +861,25 @@ def apply_ip_validation(S, val):
                     vm_options.insert(0, r[vc])
             vm_options += [r["VM/Baremetal Re-invent"], r["VM/Baremetal KRI"]]
 
-        old_host = df.at[survivor, "Hostname"]
+        old_host, old_key = df.at[survivor, "Hostname"], df.at[survivor, "_key"]
         if old_host != final:
             df.at[survivor, "Hostname"] = final
             _log(S, menu, final, "Hostname", old_host, final, f"IP {ip}: diganti sesuai Validasi Final Hostname")
+        if old_key != fk:
+            S["gone"][old_key] = f"sudah diganti menjadi {final} lewat validasi {menu}"
         df.at[survivor, "_key"] = fk
         _fill_vm(S, survivor, vm_options, menu)
         for o in others:
+            ok = df.at[o, "_key"]
             _log(S, menu, df.at[o, "Hostname"], "(baris dihapus)", df.at[o, "Hostname"], "",
                  f"IP {ip}: baris bentrok dihapus, diganti hostname final {final}")
+            if ok != fk:
+                S["gone"][ok] = f"sudah dihapus lewat validasi {menu} (diganti {final})"
             S["deleted"].add(o)
             S["fills"].pop(o, None)
+            m = S["marks"].pop(o, None)
+            if m:
+                _gugur(S, m["menu"], m["ip"], m["host"], f"GUGUR: baris dihapus lewat validasi {menu}")
         _strip(S, survivor, IP_FILLS)
         _complete_cleanup(S, survivor)
 
@@ -816,70 +892,127 @@ def apply_ip_validation(S, val):
 
     # bandingkan dengan data sebelumnya: konflik IP yang masih tersisa tapi tidak ada di file validasi
     ip_rows = defaultdict(list)
-    for i, ips in zip(df.index, df["_ips"]):
-        for ip in ips:
+    for i in df.index:
+        for ip in S["ips"].get(i, ()):
             ip_rows[ip].append(i)
     for ip, idxs in ip_rows.items():
         if ip in validated_ips:
             continue
         use = [i for i in idxs if i in flagged] if flagged else idxs
-        if len({df.at[i, "_key"] for i in use}) > 1:
+        distinct = {df.at[i, "_key"] for i in use}
+        if len(distinct) > 1:
             for i in use:
-                _mark(S, i, f"IP {ip} sama, hostname beda - belum ada di file validasi", "Hostname", menu)
+                _mark(S, i, f"IP {ip} sama, hostname beda - belum ada di file validasi", "Hostname",
+                      menu, "ip", ip, distinct)
 
 
 def apply_ip_oam_validation(S, val):
     """
     Hostname sama, IP beda.
-    ip_oam di file sebelumnya diganti dengan 'Validasi IP_OAM'. Jika validasi kosong -> baris ditandai.
+    ip_oam diganti dengan 'Validasi IP_OAM'. Validasi kosong -> ditandai. Hostname yang sudah
+    dihapus/diganti lewat menu 'IP sama, hostname beda' -> entri GUGUR.
     """
     menu = MENU_HOST
     df = S["df"]
     key_idx = defaultdict(list)
-    for i, k in zip(df.index, df["_key"]):
-        if k:
-            key_idx[k].append(i)
+    for i in df.index:
+        if df.at[i, "_key"]:
+            key_idx[df.at[i, "_key"]].append(i)
 
     for _, r in val.iterrows():
         keys = {host_key(r["Hostname Re-invent"]), host_key(r["Hostname KRI"])} - {""}
         if not keys:
             continue
         names = " | ".join(sorted({clean(r[c]) for c in ("Hostname Re-invent", "Hostname KRI") if clean(r[c])}))
-        cand = [i for k in keys for i in key_idx.get(k, []) if i in df.index]
+        cand = list(dict.fromkeys(i for k in keys for i in key_idx.get(k, []) if i not in S["deleted"]))
         if not cand:
-            S["notfound"].append({"Menu": menu, "IP": clean(r["ip_oam Re-invent"]), "Hostname": names,
-                                  "Alasan": "Hostname tidak ditemukan di file hasil sebelumnya"})
+            gone_keys = [k for k in sorted(keys) if k in S["gone"]]
+            ip_txt = clean(r["ip_oam Re-invent"])
+            if gone_keys:
+                _gugur(S, menu, ip_txt, names, f"GUGUR: hostname {gone_keys[0]} {S['gone'][gone_keys[0]]}")
+            else:
+                S["notfound"].append({"Menu": menu, "IP": ip_txt, "Hostname": names,
+                                      "Alasan": "Hostname tidak ditemukan di file hasil sebelumnya "
+                                                "(salah ketik, atau sudah diselesaikan - upload Laporan_Validasi "
+                                                "sebelumnya sebagai riwayat)"})
             continue
         new_ip = clean(r["Validasi IP_OAM"])
         if not new_ip:
             for i in cand:
-                _mark(S, i, "Validasi IP_OAM masih kosong", "ip_oam", menu)
+                _mark(S, i, "Validasi IP_OAM masih kosong", "ip_oam", menu, "hostip", "", keys)
             continue
         if not ip_set(new_ip):
-            S["warns"].append({"Menu": menu, "Detail": f"{names}: Validasi IP_OAM '{new_ip}' bukan format IP, tidak diterapkan"})
+            S["warns"].append({"Menu": menu, "Detail": f"{names}: Validasi IP_OAM '{new_ip}' bukan format IP, "
+                               "tidak diterapkan"})
             for i in cand:
-                _mark(S, i, f"Validasi IP_OAM tidak valid: {new_ip}", "ip_oam", menu)
+                _mark(S, i, f"Validasi IP_OAM tidak valid: {new_ip}", "ip_oam", menu, "hostip", "", keys)
             continue
         file_ip = ip_set(r["ip_oam Re-invent"])
+        new_set = ip_set(new_ip)
         for i in cand:
             old = df.at[i, "ip_oam"]
-            if file_ip and ip_set(old) and ip_set(old).isdisjoint(file_ip):
-                S["warns"].append({"Menu": menu, "Detail": f"{names}: ip_oam di file sebelumnya ({old}) berbeda dengan "
-                                   f"ip_oam Re-invent di file validasi ({clean(r['ip_oam Re-invent'])}); tetap diganti"})
+            old_set = S["ips"].get(i, set())
+            if file_ip and old_set and old_set.isdisjoint(file_ip):
+                S["warns"].append({"Menu": menu, "Detail": f"{names}: ip_oam di file sebelumnya ({old}) berbeda "
+                                   f"dengan ip_oam Re-invent di file validasi ({clean(r['ip_oam Re-invent'])}); "
+                                   "tetap diganti"})
             if old != new_ip:
                 df.at[i, "ip_oam"] = new_ip
+                S["ips"][i] = new_set
+                S["ip_hist"][df.at[i, "_key"]] |= (old_set - new_set)
+                S["new_ips"][i] = new_set
                 _log(S, menu, df.at[i, "Hostname"], "ip_oam", old, new_ip, "Diganti sesuai Validasi IP_OAM")
             _fill_vm(S, i, [r["VM/Baremetal Re-invent"], r["VM/Baremetal KRI"]], menu)
-            _strip(S, i, HIP_FILLS)
+            _strip(S, i, HIP_FILLS | IP_FILLS)   # IP sudah divalidasi -> konflik IP lama tidak berlaku lagi
             _complete_cleanup(S, i)
-            S["marks"].pop(i, None)
+            m = S["marks"].get(i)
+            if m and m["kind"] == "ip":
+                _gugur(S, m["menu"], m["ip"], m["host"], f"GUGUR: IP hostname sudah diganti lewat validasi {menu}")
+            _unmark(S, i, HIP_FILLS | IP_FILLS)
 
 
-def run_validation(prev_df, prev_fills, jobs):
-    """jobs: list of (menu, DataFrame validasi). Urutan: IP sama dulu, lalu hostname sama."""
-    S = _new_state(prev_df, prev_fills)
-    for menu, val in sorted(jobs, key=lambda j: 0 if j[0] == MENU_IP else 1):
+def _finalize(S):
+    """Sinkronkan kedua menu: hapus tanda yang sudah tidak relevan + cek IP baru yang bentrok."""
+    df = S["df"]
+    ip_rows = defaultdict(list)
+    for i in df.index:
+        for ip in S["ips"].get(i, ()):
+            ip_rows[ip].append(i)
+
+    for idx, m in list(S["marks"].items()):
+        if idx not in df.index:      # baris sudah dihapus menu lain -> tanda gugur
+            S["marks"].pop(idx)
+            _gugur(S, m["menu"], m["ip"], m["host"], "GUGUR: baris sudah dihapus lewat validasi " + MENU_IP)
+            continue
+        if m["kind"] == "ip":
+            cur = {df.at[j, "_key"] for j in ip_rows.get(m["ip"], []) if df.at[j, "_key"] in m["keys"]}
+            if len(cur) < 2:         # konflik IP sudah tidak ada (IP diganti menu lain)
+                _unmark(S, idx, IP_FILLS)
+                _complete_cleanup(S, idx)
+                _gugur(S, m["menu"], m["ip"], m["host"],
+                       f"GUGUR: konflik IP sudah tidak ada (IP hostname terkait sudah diganti lewat {MENU_HOST})")
+
+    seen = set()
+    for idx, new_set in S["new_ips"].items():
+        if idx not in df.index:
+            continue
+        for ip in new_set:
+            for j in ip_rows.get(ip, []):
+                if j != idx and df.at[j, "_key"] != df.at[idx, "_key"] and (idx, j) not in seen:
+                    seen.add((idx, j)); seen.add((j, idx))
+                    S["warns"].append({"Menu": MENU_HOST, "Detail": f"IP baru {ip} untuk {df.at[idx, 'Hostname']} "
+                                       f"sama dengan hostname lain: {df.at[j, 'Hostname']} (perlu validasi lagi)"})
+
+
+def run_validation(prev_df, prev_fills, jobs, first=MENU_IP, history=None):
+    """
+    jobs  : list of (menu, DataFrame validasi)
+    first : menu yang diterapkan lebih dulu (memengaruhi menu berikutnya)
+    """
+    S = _new_state(prev_df, prev_fills, history)
+    for menu, val in sorted(jobs, key=lambda j: 0 if j[0] == first else 1):
         (apply_ip_validation if menu == MENU_IP else apply_ip_oam_validation)(S, val)
+    _finalize(S)
     return S
 
 
@@ -889,110 +1022,83 @@ def build_validation_outputs(S, rows_before):
     main = df[REINVENT_COLS].copy()
     main["No"] = list(range(1, len(main) + 1))
 
-    colors, cells = {}, []
+    colors, cells, marked = {}, [], []
     for pos, oi in enumerate(old_idx):
         if oi in S["marks"]:
+            m = S["marks"][oi]
             colors[pos] = MARK_ROW
-            cells.append((pos, S["marks"][oi][1], MARK_CELL))
+            cells.append((pos, m["col"], MARK_CELL))
+            marked.append({"Menu": m["menu"], "Hostname": df.at[pos, "Hostname"], "ip_oam": df.at[pos, "ip_oam"],
+                           "Alasan": m["reason"]})
         else:
             for col, rgb in S["fills"].get(oi, {}).items():
                 cells.append((pos, col, rgb))
 
-    log_df = pd.DataFrame(S["log"], columns=["Menu", "Hostname", "Field", "Nilai lama", "Nilai baru", "Keterangan"])
-    marked_df = pd.DataFrame(S["marked"], columns=["Menu", "Hostname", "ip_oam", "Alasan"])
+    log_df = pd.DataFrame(S["log"], columns=LOG_COLS)
+    marked_df = pd.DataFrame(marked, columns=["Menu", "Hostname", "ip_oam", "Alasan"])
+    gugur_df = pd.DataFrame(S["gugur"], columns=["Menu", "IP", "Hostname", "Alasan"]).drop_duplicates(
+        ignore_index=True)
     nf_df = pd.DataFrame(S["notfound"], columns=["Menu", "IP", "Hostname", "Alasan"])
-    warn_df = pd.DataFrame(S["warns"], columns=["Menu", "Detail"])
+    warn_df = pd.DataFrame(S["warns"], columns=["Menu", "Detail"]).drop_duplicates(ignore_index=True)
     summary = pd.DataFrame([
         ("Baris file hasil sebelumnya", rows_before),
         ("Baris setelah validasi", len(main)),
         ("Baris dihapus (bentrok IP)", len(S["deleted"])),
         ("Jumlah perubahan nilai", len(log_df)),
         ("Baris DITANDAI (validasi kosong / belum divalidasi)", len(marked_df)),
+        ("Entri GUGUR (sudah terselesaikan oleh menu lain)", len(gugur_df)),
         ("Data validasi tidak ditemukan di file sebelumnya", len(nf_df)),
         ("Peringatan", len(warn_df)),
     ], columns=["Keterangan", "Jumlah"])
 
     main_bytes = to_excel({MAIN_SHEET: main}, {MAIN_SHEET: colors}, {MAIN_SHEET: cells})
     report_bytes = to_excel({"Ringkasan": summary, "Log_Perubahan": log_df, "Ditandai": marked_df,
-                             "Tidak_Ditemukan": nf_df, "Peringatan": warn_df})
+                             "Gugur_Terselesaikan": gugur_df, "Tidak_Ditemukan": nf_df, "Peringatan": warn_df})
     return dict(main=main, main_bytes=main_bytes, report_bytes=report_bytes, summary=summary,
-                log=log_df, marked=marked_df, notfound=nf_df, warns=warn_df)
+                log=log_df, marked=marked_df, gugur=gugur_df, notfound=nf_df, warns=warn_df)
 
 
-def validation_page():
-    st.title("✅ Terapkan Validasi (Perbaikan)")
-    st.caption("Upload file hasil olahan sebelumnya + file Excel validasi yang sudah Anda isi. "
-               "Aplikasi menerapkan perbaikan dan menandai baris yang validasinya masih kosong.")
+VAL_SPECS = {
+    MENU_IP: dict(
+        cols=VAL_IP_COLS, aliases=VAL_IP_ALIASES, must="Validasi Final Hostname",
+        sheet="IP_Sama_Hostname_Beda", key="val_ip",
+        label="File validasi 'IP sama, hostname beda' (kolom: IP, Hostname Re-invent, Hostname KRI, "
+              "VM/Baremetal Re-invent, VM/Baremetal KRI, Validasi Final Hostname)"),
+    MENU_HOST: dict(
+        cols=VAL_HOST_COLS, aliases=VAL_HOST_ALIASES, must="Validasi IP_OAM",
+        sheet="Hostname_Sama_IP_Beda", key="val_host",
+        label="File validasi 'Hostname sama, IP beda' (kolom: Hostname Re-invent, Hostname KRI, ip_oam Re-invent, "
+              "IP OAM KRI, VM/Baremetal Re-invent, VM/Baremetal KRI, Keterangan, Validasi IP_OAM)"),
+}
+WORK_KEY = "val_work"   # kunci st.session_state: hasil langkah yang sedang berjalan
 
-    with st.sidebar:
-        st.header("Menu yang diperbaiki")
-        menus = st.multiselect("Pilih menu", [MENU_IP, MENU_HOST], default=[MENU_IP])
-        st.header("Upload file")
-        f_prev = st.file_uploader("File hasil olahan sebelumnya (Reinvent_Updated.xlsx)",
-                                  type=["xlsx", "xls", "csv"], key="prev_main")
-        f_val = {}
-        if MENU_IP in menus:
-            f_val[MENU_IP] = st.file_uploader(
-                "Validasi 'IP sama, hostname beda' (kolom: IP, Hostname Re-invent, Hostname KRI, "
-                "VM/Baremetal Re-invent, VM/Baremetal KRI, Validasi Final Hostname)",
-                type=["xlsx", "xls", "csv"], key="val_ip")
-        if MENU_HOST in menus:
-            f_val[MENU_HOST] = st.file_uploader(
-                "Validasi 'Hostname sama, IP beda' (kolom: Hostname Re-invent, Hostname KRI, ip_oam Re-invent, "
-                "IP OAM KRI, VM/Baremetal Re-invent, VM/Baremetal KRI, Keterangan, Validasi IP_OAM)",
-                type=["xlsx", "xls", "csv"], key="val_host")
 
-    if not menus:
-        st.info("Pilih minimal satu menu di sidebar.")
-        st.stop()
-    if f_prev is None or any(f is None for f in f_val.values()):
-        st.info("Upload file hasil olahan sebelumnya dan file validasi untuk setiap menu yang dipilih.")
-        st.stop()
+def load_validation(menu, f):
+    """Baca + validasi file validasi sebuah menu. Raise ValueError jika kolom wajib tidak ada."""
+    sp = VAL_SPECS[menu]
+    raw = read_any(f, f"Validasi {menu}", prefer_sheet=sp["sheet"])
+    val, miss_v = standardize(raw, sp["cols"], sp["aliases"])
+    need = [c for c in (sp["must"], "Hostname Re-invent") if c in miss_v]
+    if menu == MENU_IP and "IP" in miss_v:
+        need.append("IP")
+    if need:
+        raise ValueError(f"File validasi '{menu}' wajib punya kolom: {', '.join(need)}")
+    return val
 
-    try:
-        prev_df, prev_fills, miss = read_prev_main(f_prev)
-    except Exception as e:
-        st.error(f"Gagal membaca file hasil sebelumnya: {e}")
-        st.stop()
-    if "Hostname" in miss:
-        st.error("Kolom Hostname tidak ditemukan di file hasil sebelumnya.")
-        st.stop()
-    if miss:
-        st.warning(f"Kolom tidak ditemukan di file sebelumnya (dikosongkan): {', '.join(miss)}")
 
-    specs = {MENU_IP: (VAL_IP_COLS, VAL_IP_ALIASES, "Validasi Final Hostname", "sheet IP_Sama_Hostname_Beda"),
-             MENU_HOST: (VAL_HOST_COLS, VAL_HOST_ALIASES, "Validasi IP_OAM", "sheet Hostname_Sama_IP_Beda")}
-    sheet_pref = {MENU_IP: "IP_Sama_Hostname_Beda", MENU_HOST: "Hostname_Sama_IP_Beda"}
-    jobs = []
-    for menu, f in f_val.items():
-        cols, aliases, must, _ = specs[menu]
-        try:
-            raw = read_any(f, f"Validasi {menu}", prefer_sheet=sheet_pref[menu])
-        except Exception as e:
-            st.error(f"Gagal membaca file validasi '{menu}': {e}")
-            st.stop()
-        val, miss_v = standardize(raw, cols, aliases)
-        need = [c for c in (must, "Hostname Re-invent") if c in miss_v]
-        if "IP" in miss_v and menu == MENU_IP:
-            need.append("IP")
-        if need:
-            st.error(f"File validasi '{menu}' wajib punya kolom: {', '.join(need)}")
-            st.stop()
-        jobs.append((menu, val))
-
-    S = run_validation(prev_df, prev_fills, jobs)
-    O = build_validation_outputs(S, len(prev_df))
-
+def render_validation_results(O, done):
+    st.subheader("Hasil setelah: " + "  ➜  ".join(done))
     sm = dict(zip(O["summary"]["Keterangan"], O["summary"]["Jumlah"]))
     c = st.columns(4)
     c[0].metric("Baris sebelum", sm["Baris file hasil sebelumnya"])
     c[1].metric("Baris sesudah", sm["Baris setelah validasi"])
     c[2].metric("Perubahan nilai", sm["Jumlah perubahan nilai"])
     c[3].metric("Baris dihapus", sm["Baris dihapus (bentrok IP)"])
-    c = st.columns(3)
+    c = st.columns(4)
     c[0].metric("🟥 Ditandai (validasi kosong)", sm["Baris DITANDAI (validasi kosong / belum divalidasi)"])
-    c[1].metric("Tidak ditemukan", sm["Data validasi tidak ditemukan di file sebelumnya"])
-    c[2].metric("Peringatan", sm["Peringatan"])
+    c[1].metric("Entri gugur (terkait menu lain)", sm["Entri GUGUR (sudah terselesaikan oleh menu lain)"])
+    c[2].metric("Tidak ditemukan", sm["Data validasi tidak ditemukan di file sebelumnya"])
+    c[3].metric("Peringatan", sm["Peringatan"])
 
     st.markdown("**Warna di file hasil:** 🟥 baris ditandai - Validasi Final Hostname / Validasi IP_OAM masih kosong "
                 "atau konflik belum ada di file validasi. Warna lain dari hasil sebelumnya dipertahankan.")
@@ -1000,14 +1106,103 @@ def validation_page():
     d1, d2 = st.columns(2)
     d1.download_button("⬇️ Download FILE HASIL VALIDASI (format Re-invent)", O["main_bytes"],
                        "Reinvent_Updated_Validasi.xlsx", XLSX, type="primary")
-    d2.download_button("⬇️ Download LAPORAN VALIDASI (log, ditandai, tidak ditemukan)", O["report_bytes"],
+    d2.download_button("⬇️ Download LAPORAN VALIDASI (log, ditandai, gugur, dll)", O["report_bytes"],
                        "Laporan_Validasi.xlsx", XLSX)
 
-    tabs = st.tabs(["File hasil", "Log perubahan", "Ditandai (kosong)", "Tidak ditemukan", "Peringatan"])
-    for tab, df in zip(tabs, [O["main"], O["log"], O["marked"], O["notfound"], O["warns"]]):
+    tabs = st.tabs(["File hasil", "Log perubahan", "Ditandai (kosong)", "Gugur (terselesaikan)",
+                    "Tidak ditemukan", "Peringatan"])
+    for tab, df in zip(tabs, [O["main"], O["log"], O["marked"], O["gugur"], O["notfound"], O["warns"]]):
         with tab:
             st.write(f"{len(df)} baris")
             st.dataframe(df, hide_index=True)
+
+
+def validation_page():
+    st.title("✅ Terapkan Validasi (Perbaikan)")
+    st.caption("Proses satu menu dulu. Setelah selesai, baru upload file validasi menu lainnya - hasil langkah 1 "
+               "otomatis dipakai sebagai dasar langkah 2 (kedua menu saling berkorelasi).")
+
+    work = st.session_state.get(WORK_KEY)
+
+    # ---------------- LANGKAH 1 ----------------
+    if work is None:
+        st.subheader("Langkah 1 - pilih menu dan upload file")
+        menu1 = st.radio("Menu yang diproses lebih dulu", [MENU_IP, MENU_HOST], horizontal=True, key="start_menu")
+        f_prev = st.file_uploader("1) File hasil olahan sebelumnya (Reinvent_Updated.xlsx)",
+                                  type=["xlsx", "xls", "csv"], key="prev_main")
+        f_val = st.file_uploader("2) " + VAL_SPECS[menu1]["label"], type=["xlsx", "xls", "csv"],
+                                 key=VAL_SPECS[menu1]["key"])
+        f_hist = st.file_uploader(
+            "3) (Opsional) Laporan_Validasi.xlsx dari validasi sebelumnya", type=["xlsx"], key="hist",
+            help="Hanya jika menu lain sudah dikerjakan di sesi/hari sebelumnya, supaya entri yang sudah "
+                 "terselesaikan otomatis gugur.")
+        go = st.button("▶️ Proses langkah 1", type="primary", key="go1",
+                       disabled=(f_prev is None or f_val is None))
+        if not go:
+            st.info("Upload file hasil olahan sebelumnya dan file validasi menu terpilih, lalu klik **Proses langkah 1**.")
+            return
+
+        try:
+            prev_df, prev_fills, miss = read_prev_main(f_prev)
+        except Exception as e:
+            st.error(f"Gagal membaca file hasil sebelumnya: {e}")
+            return
+        if "Hostname" in miss:
+            st.error("Kolom Hostname tidak ditemukan di file hasil sebelumnya.")
+            return
+        if miss:
+            st.warning(f"Kolom tidak ditemukan di file sebelumnya (dikosongkan): {', '.join(miss)}")
+        history = None
+        if f_hist is not None:
+            try:
+                history = read_history(f_hist)
+            except Exception as e:
+                st.warning(f"Riwayat tidak terbaca (butuh sheet Log_Perubahan): {e}")
+        try:
+            val = load_validation(menu1, f_val)
+        except Exception as e:
+            st.error(str(e))
+            return
+
+        S = run_validation(prev_df, prev_fills, [(menu1, val)], first=menu1, history=history)
+        st.session_state[WORK_KEY] = dict(S=S, done=[menu1], rows_before=len(prev_df),
+                                          O=build_validation_outputs(S, len(prev_df)))
+        st.rerun()
+        return
+
+    # ---------------- HASIL + LANGKAH 2 ----------------
+    done = work["done"]
+    st.success("✅ Langkah 1 selesai: " + done[0] + (f"  |  ✅ Langkah 2 selesai: {done[1]}" if len(done) > 1 else ""))
+    render_validation_results(work["O"], done)
+    st.divider()
+
+    remaining = [m for m in (MENU_IP, MENU_HOST) if m not in done]
+    if remaining:
+        m2 = remaining[0]
+        st.subheader(f"Langkah 2 - {m2}")
+        st.caption("Tidak perlu upload ulang file hasil sebelumnya: hasil langkah 1 otomatis dipakai. "
+                   "Entri yang sudah terselesaikan di langkah 1 akan gugur otomatis.")
+        f2 = st.file_uploader(VAL_SPECS[m2]["label"], type=["xlsx", "xls", "csv"], key=VAL_SPECS[m2]["key"])
+        if st.button("▶️ Proses langkah 2", type="primary", key="go2", disabled=(f2 is None)):
+            try:
+                val2 = load_validation(m2, f2)
+            except Exception as e:
+                st.error(str(e))
+                return
+            S = work["S"]
+            (apply_ip_validation if m2 == MENU_IP else apply_ip_oam_validation)(S, val2)
+            _finalize(S)
+            work["done"].append(m2)
+            work["O"] = build_validation_outputs(S, work["rows_before"])
+            st.session_state[WORK_KEY] = work
+            st.rerun()
+            return
+    else:
+        st.success("Kedua menu sudah diproses ✅  Download file hasil di atas.")
+
+    if st.button("🔄 Mulai ulang dari awal", key="reset"):
+        st.session_state.pop(WORK_KEY, None)
+        st.rerun()
 
 
 def main():
