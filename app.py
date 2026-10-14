@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -178,16 +179,21 @@ def parse_dates(series):
     return pd.concat(parts).reindex(series.index)
 
 
-def standardize(df, canon, aliases):
-    """Samakan nama kolom ke daftar kanonik; kolom yang hilang diisi kosong."""
+def canon_map(columns, canon, aliases):
+    """{nama kolom asli: nama kolom kanonik} (tanpa peduli huruf besar/kecil, spasi, simbol)."""
     lookup = {norm_col(c): c for c in canon}
     lookup.update({norm_col(k): v for k, v in aliases.items()})
     rename = {}
-    for c in df.columns:
+    for c in columns:
         n = norm_col(c)
         if n in lookup and lookup[n] not in rename.values():
             rename[c] = lookup[n]
-    df = df.rename(columns=rename)
+    return rename
+
+
+def standardize(df, canon, aliases):
+    """Samakan nama kolom ke daftar kanonik; kolom yang hilang diisi kosong."""
+    df = df.rename(columns=canon_map(df.columns, canon, aliases))
     missing = [c for c in canon if c not in df.columns]
     for c in missing:
         df[c] = ""
@@ -347,18 +353,16 @@ def compute(re_df, kri_df, opts=None):
                     "IP": ip,
                     "Hostname Re-invent": re_df.at[i, "Hostname"],
                     "Hostname KRI": kr["Hostname"],
-                    "Apps Re-invent": re_df.at[i, "Apps"],
-                    "Apps KRI": kr["Apps"],
                     "VM/Baremetal Re-invent": re_df.at[i, "VM/Baremetal"],
                     "VM/Baremetal KRI": kr["VM/Baremetal"],
-                    "Keterangan": "Hostname berbeda tetapi IP sama - baris dipisahkan/ditandai di file utama",
+                    "Validasi Final Hostname": "",
                 })
                 flags[i].add("ip")
                 for j in key_to_idx.get(kr["_key"], []):
                     flags[j].add("ip")
     conf_df = pd.DataFrame(conf, columns=[
-        "IP", "Hostname Re-invent", "Hostname KRI", "Apps Re-invent", "Apps KRI",
-        "VM/Baremetal Re-invent", "VM/Baremetal KRI", "Keterangan"])
+        "IP", "Hostname Re-invent", "Hostname KRI", "VM/Baremetal Re-invent",
+        "VM/Baremetal KRI", "Validasi Final Hostname"])
 
     # --- hostname sama, IP beda ---------------------------------------------
     hip = []
@@ -374,10 +378,11 @@ def compute(re_df, kri_df, opts=None):
                 hip.append({"Hostname Re-invent": row["Hostname"], "Hostname KRI": kri_idx.at[k, "Hostname"],
                             "ip_oam Re-invent": row["ip_oam"], "IP OAM KRI": kri_idx.at[k, "IP OAM"],
                             "VM/Baremetal Re-invent": vm_re, "VM/Baremetal KRI": vm_kri,
-                            "Keterangan": ket})
+                            "Keterangan": ket, "Validasi IP_OAM": ""})
                 flags[i].add("hip")
     hip_df = pd.DataFrame(hip, columns=["Hostname Re-invent", "Hostname KRI", "ip_oam Re-invent", "IP OAM KRI",
-                                        "VM/Baremetal Re-invent", "VM/Baremetal KRI", "Keterangan"])
+                                        "VM/Baremetal Re-invent", "VM/Baremetal KRI", "Keterangan",
+                                        "Validasi IP_OAM"])
 
     # --- hostname duplikat (di Re-invent maupun KRI) -> tandai baris terkait ---
     for k in set(dup_re["_key"]) | set(dup_kri["_key"]):
@@ -584,7 +589,7 @@ DATA_DIR = Path(__file__).parent / "data"
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
-def read_any(src, label):
+def read_any(src, label, prefer_sheet=None):
     """src: UploadedFile / Path / DataFrame. Mendukung xlsx, xls, csv; xlsx multi-sheet bisa dipilih."""
     if isinstance(src, pd.DataFrame):
         return src
@@ -592,8 +597,8 @@ def read_any(src, label):
     if name.endswith(".csv"):
         return pd.read_csv(src, dtype=str, keep_default_na=False)
     xl = pd.ExcelFile(src)
-    sheet = xl.sheet_names[0]
-    if len(xl.sheet_names) > 1:
+    sheet = prefer_sheet if prefer_sheet in xl.sheet_names else xl.sheet_names[0]
+    if len(xl.sheet_names) > 1 and prefer_sheet not in xl.sheet_names:
         sheet = st.sidebar.selectbox(f"Sheet {label}", xl.sheet_names, key=f"sheet_{label}")
     return xl.parse(sheet, dtype=str)
 
@@ -607,8 +612,411 @@ def find_file(folder, keyword):
     return None
 
 
+# ----------------------------------------------------------------------------
+# MENU 2: TERAPKAN VALIDASI (PERBAIKAN) DARI FILE EXCEL HASIL VALIDASI
+# ----------------------------------------------------------------------------
+MENU_IP = "IP sama, hostname beda"
+MENU_HOST = "Hostname sama, IP beda"
+
+# kolom template file validasi
+VAL_IP_COLS = ["IP", "Hostname Re-invent", "Hostname KRI", "VM/Baremetal Re-invent",
+               "VM/Baremetal KRI", "Validasi Final Hostname"]
+VAL_IP_ALIASES = {"VM/Baremeteal Re-invent": "VM/Baremetal Re-invent",
+                  "VM/Baremeteal KRI": "VM/Baremetal KRI",
+                  "Validasi Final": "Validasi Final Hostname"}
+VAL_HOST_COLS = ["Hostname Re-invent", "Hostname KRI", "ip_oam Re-invent", "IP OAM KRI",
+                 "VM/Baremetal Re-invent", "VM/Baremetal KRI", "Keterangan", "Validasi IP_OAM"]
+VAL_HOST_ALIASES = {"VM/Baremeteal Re-invent": "VM/Baremetal Re-invent",
+                    "VM/Baremeteal KRI": "VM/Baremetal KRI",
+                    "Validasi IP": "Validasi IP_OAM", "Validasi OAM": "Validasi IP_OAM"}
+
+# warna penanda "validasi masih kosong / belum divalidasi"
+MARK_ROW = "FFC7CE"
+MARK_CELL = "FF5050"
+
+IP_FILLS = {COLORS["ip"], CELL_COLORS["ip"]}
+HIP_FILLS = {COLORS["hip"], CELL_COLORS["hip"]}
+INC_FILLS = {COLORS["inc"], CELL_COLORS["inc"]}
+
+
+def cell_rgb(c):
+    """Warna isian (solid) sebuah sel openpyxl -> 'RRGGBB' atau None."""
+    f = c.fill
+    if f is None or f.fill_type != "solid":
+        return None
+    v = getattr(f.start_color, "rgb", None)
+    if isinstance(v, str) and len(v) in (6, 8):
+        return v[-6:].upper()
+    return None
+
+
+def read_prev_main(src):
+    """
+    Baca file hasil olahan sebelumnya (Reinvent_Updated.xlsx) beserta warna selnya.
+    Return: (DataFrame kolom Re-invent, {nomor_baris: {kolom: warna}}, kolom_hilang)
+    """
+    name = (src.name if hasattr(src, "name") else str(src)).lower()
+    fills = {}
+    if name.endswith(".xlsx"):
+        raw_bytes = src.getvalue() if hasattr(src, "getvalue") else Path(src).read_bytes()
+        wb = load_workbook(io.BytesIO(raw_bytes), data_only=True)
+        ws = wb[MAIN_SHEET] if MAIN_SHEET in wb.sheetnames else wb.worksheets[0]
+        rows = list(ws.iter_rows())
+        header = [clean(c.value) for c in rows[0]] if rows else []
+        cmap = canon_map(header, REINVENT_COLS, REINVENT_ALIASES)
+        data = []
+        for r in rows[1:]:
+            vals = [clean(c.value) for c in r]
+            if not any(vals):
+                continue
+            fl = {}
+            for i, c in enumerate(r):
+                col = cmap.get(header[i]) if i < len(header) else None
+                rgb = cell_rgb(c)
+                if col and rgb:
+                    fl[col] = rgb
+            fills[len(data)] = fl
+            data.append(vals)
+        raw = pd.DataFrame(data, columns=header)
+    else:
+        raw = read_any(src, "File sebelumnya")
+    df, missing = standardize(raw, REINVENT_COLS, REINVENT_ALIASES)
+    return df, fills, missing
+
+
+def _new_state(df, fills):
+    df = df.copy()
+    df["_key"] = df["Hostname"].map(host_key)
+    df["_ips"] = df["ip_oam"].map(ip_set)
+    return dict(df=df, fills=dict(fills), marks={}, marked=[], deleted=set(),
+                log=[], notfound=[], warns=[])
+
+
+def _log(S, menu, host, field, old, new, ket=""):
+    S["log"].append({"Menu": menu, "Hostname": host, "Field": field,
+                     "Nilai lama": old, "Nilai baru": new, "Keterangan": ket})
+
+
+def _mark(S, idx, reason, col, menu):
+    if idx in S["marks"]:
+        return
+    S["marks"][idx] = (reason, col)
+    S["fills"].pop(idx, None)
+    S["marked"].append({"Menu": menu, "Hostname": S["df"].at[idx, "Hostname"],
+                        "ip_oam": S["df"].at[idx, "ip_oam"], "Alasan": reason})
+
+
+def _strip(S, idx, remove):
+    f = S["fills"].get(idx)
+    if f:
+        S["fills"][idx] = {k: v for k, v in f.items() if v not in remove}
+
+
+def _complete_cleanup(S, idx):
+    """Jika Hostname & VM/Baremetal sudah terisi, hapus warna 'kosong' (oranye)."""
+    df = S["df"]
+    if df.at[idx, "Hostname"] and df.at[idx, "VM/Baremetal"]:
+        _strip(S, idx, INC_FILLS)
+
+
+def _fill_vm(S, idx, options, menu):
+    df = S["df"]
+    if df.at[idx, "VM/Baremetal"]:
+        return
+    for v in options:
+        v = clean(v)
+        if v:
+            df.at[idx, "VM/Baremetal"] = v
+            _log(S, menu, df.at[idx, "Hostname"], "VM/Baremetal", "", v, "Diisi dari data validasi / baris lain")
+            return
+
+
+def apply_ip_validation(S, val):
+    """
+    IP sama, hostname beda.
+    Untuk tiap IP: baris-baris yang bentrok di file sebelumnya dihapus lalu diganti SATU baris
+    dengan Hostname = 'Validasi Final Hostname'. Jika validasi kosong -> baris ditandai.
+    """
+    menu = MENU_IP
+    df = S["df"]
+    flagged = {i for i, f in S["fills"].items() if set(f.values()) & IP_FILLS}  # bentrok dari hasil lama
+
+    ip_idx = defaultdict(list)
+    for i, ips in zip(df.index, df["_ips"]):
+        for ip in ips:
+            ip_idx[ip].append(i)
+
+    groups = {}
+    for _, r in val.iterrows():
+        ips = sorted(ip_set(r["IP"]))
+        if not ips:
+            if any(clean(r[c]) for c in val.columns):
+                S["warns"].append({"Menu": menu, "Detail": "IP kosong/tidak valid di file validasi "
+                                   f"(Hostname Re-invent={r['Hostname Re-invent']}, KRI={r['Hostname KRI']})"})
+            continue
+        groups.setdefault(ips[0], []).append(r)
+    validated_ips = set(groups)
+
+    for ip, rows in groups.items():
+        keys = set()
+        for r in rows:
+            keys |= {host_key(r["Hostname Re-invent"]), host_key(r["Hostname KRI"])}
+        keys.discard("")
+        re_keys = {host_key(r["Hostname Re-invent"]) for r in rows} - {""}
+        names = " | ".join(sorted({clean(r[c]) for r in rows for c in ("Hostname Re-invent", "Hostname KRI") if clean(r[c])}))
+        cand = [i for i in ip_idx.get(ip, []) if i not in S["deleted"] and df.at[i, "_key"] in keys]
+        if not cand:
+            S["notfound"].append({"Menu": menu, "IP": ip, "Hostname": names,
+                                  "Alasan": "IP + hostname tidak ditemukan di file hasil sebelumnya"})
+            continue
+
+        finals = [clean(r["Validasi Final Hostname"]) for r in rows if clean(r["Validasi Final Hostname"])]
+        if not finals:
+            for i in cand:
+                _mark(S, i, "Validasi Final Hostname masih kosong", "Hostname", menu)
+            continue
+        final = finals[0]
+        fk = host_key(final)
+        if len({host_key(f) for f in finals}) > 1:
+            S["warns"].append({"Menu": menu, "Detail": f"IP {ip}: validasi final berbeda-beda "
+                               f"({', '.join(sorted(set(finals)))}); dipakai: {final}"})
+
+        survivor = next((i for i in cand if df.at[i, "_key"] == fk), None)
+        if survivor is None:
+            survivor = next((i for i in cand if df.at[i, "_key"] in re_keys), cand[0])
+        others = [i for i in cand if i != survivor]
+
+        vm_options = [df.at[o, "VM/Baremetal"] for o in others]
+        for r in rows:
+            for hc, vc in (("Hostname Re-invent", "VM/Baremetal Re-invent"), ("Hostname KRI", "VM/Baremetal KRI")):
+                if host_key(r[hc]) == fk:
+                    vm_options.insert(0, r[vc])
+            vm_options += [r["VM/Baremetal Re-invent"], r["VM/Baremetal KRI"]]
+
+        old_host = df.at[survivor, "Hostname"]
+        if old_host != final:
+            df.at[survivor, "Hostname"] = final
+            _log(S, menu, final, "Hostname", old_host, final, f"IP {ip}: diganti sesuai Validasi Final Hostname")
+        df.at[survivor, "_key"] = fk
+        _fill_vm(S, survivor, vm_options, menu)
+        for o in others:
+            _log(S, menu, df.at[o, "Hostname"], "(baris dihapus)", df.at[o, "Hostname"], "",
+                 f"IP {ip}: baris bentrok dihapus, diganti hostname final {final}")
+            S["deleted"].add(o)
+            S["fills"].pop(o, None)
+        _strip(S, survivor, IP_FILLS)
+        _complete_cleanup(S, survivor)
+
+        if ((df["_key"] == fk) & ~df.index.isin(cand) & ~df.index.isin(list(S["deleted"]))).any():
+            S["warns"].append({"Menu": menu, "Detail": f"IP {ip}: hostname final '{final}' ternyata sudah ada di "
+                               "baris lain pada file sebelumnya (kemungkinan duplikat)"})
+
+    S["df"] = df.drop(index=list(S["deleted"]))
+    df = S["df"]
+
+    # bandingkan dengan data sebelumnya: konflik IP yang masih tersisa tapi tidak ada di file validasi
+    ip_rows = defaultdict(list)
+    for i, ips in zip(df.index, df["_ips"]):
+        for ip in ips:
+            ip_rows[ip].append(i)
+    for ip, idxs in ip_rows.items():
+        if ip in validated_ips:
+            continue
+        use = [i for i in idxs if i in flagged] if flagged else idxs
+        if len({df.at[i, "_key"] for i in use}) > 1:
+            for i in use:
+                _mark(S, i, f"IP {ip} sama, hostname beda - belum ada di file validasi", "Hostname", menu)
+
+
+def apply_ip_oam_validation(S, val):
+    """
+    Hostname sama, IP beda.
+    ip_oam di file sebelumnya diganti dengan 'Validasi IP_OAM'. Jika validasi kosong -> baris ditandai.
+    """
+    menu = MENU_HOST
+    df = S["df"]
+    key_idx = defaultdict(list)
+    for i, k in zip(df.index, df["_key"]):
+        if k:
+            key_idx[k].append(i)
+
+    for _, r in val.iterrows():
+        keys = {host_key(r["Hostname Re-invent"]), host_key(r["Hostname KRI"])} - {""}
+        if not keys:
+            continue
+        names = " | ".join(sorted({clean(r[c]) for c in ("Hostname Re-invent", "Hostname KRI") if clean(r[c])}))
+        cand = [i for k in keys for i in key_idx.get(k, []) if i in df.index]
+        if not cand:
+            S["notfound"].append({"Menu": menu, "IP": clean(r["ip_oam Re-invent"]), "Hostname": names,
+                                  "Alasan": "Hostname tidak ditemukan di file hasil sebelumnya"})
+            continue
+        new_ip = clean(r["Validasi IP_OAM"])
+        if not new_ip:
+            for i in cand:
+                _mark(S, i, "Validasi IP_OAM masih kosong", "ip_oam", menu)
+            continue
+        if not ip_set(new_ip):
+            S["warns"].append({"Menu": menu, "Detail": f"{names}: Validasi IP_OAM '{new_ip}' bukan format IP, tidak diterapkan"})
+            for i in cand:
+                _mark(S, i, f"Validasi IP_OAM tidak valid: {new_ip}", "ip_oam", menu)
+            continue
+        file_ip = ip_set(r["ip_oam Re-invent"])
+        for i in cand:
+            old = df.at[i, "ip_oam"]
+            if file_ip and ip_set(old) and ip_set(old).isdisjoint(file_ip):
+                S["warns"].append({"Menu": menu, "Detail": f"{names}: ip_oam di file sebelumnya ({old}) berbeda dengan "
+                                   f"ip_oam Re-invent di file validasi ({clean(r['ip_oam Re-invent'])}); tetap diganti"})
+            if old != new_ip:
+                df.at[i, "ip_oam"] = new_ip
+                _log(S, menu, df.at[i, "Hostname"], "ip_oam", old, new_ip, "Diganti sesuai Validasi IP_OAM")
+            _fill_vm(S, i, [r["VM/Baremetal Re-invent"], r["VM/Baremetal KRI"]], menu)
+            _strip(S, i, HIP_FILLS)
+            _complete_cleanup(S, i)
+            S["marks"].pop(i, None)
+
+
+def run_validation(prev_df, prev_fills, jobs):
+    """jobs: list of (menu, DataFrame validasi). Urutan: IP sama dulu, lalu hostname sama."""
+    S = _new_state(prev_df, prev_fills)
+    for menu, val in sorted(jobs, key=lambda j: 0 if j[0] == MENU_IP else 1):
+        (apply_ip_validation if menu == MENU_IP else apply_ip_oam_validation)(S, val)
+    return S
+
+
+def build_validation_outputs(S, rows_before):
+    df = S["df"].reset_index()
+    old_idx = df["index"].tolist()
+    main = df[REINVENT_COLS].copy()
+    main["No"] = list(range(1, len(main) + 1))
+
+    colors, cells = {}, []
+    for pos, oi in enumerate(old_idx):
+        if oi in S["marks"]:
+            colors[pos] = MARK_ROW
+            cells.append((pos, S["marks"][oi][1], MARK_CELL))
+        else:
+            for col, rgb in S["fills"].get(oi, {}).items():
+                cells.append((pos, col, rgb))
+
+    log_df = pd.DataFrame(S["log"], columns=["Menu", "Hostname", "Field", "Nilai lama", "Nilai baru", "Keterangan"])
+    marked_df = pd.DataFrame(S["marked"], columns=["Menu", "Hostname", "ip_oam", "Alasan"])
+    nf_df = pd.DataFrame(S["notfound"], columns=["Menu", "IP", "Hostname", "Alasan"])
+    warn_df = pd.DataFrame(S["warns"], columns=["Menu", "Detail"])
+    summary = pd.DataFrame([
+        ("Baris file hasil sebelumnya", rows_before),
+        ("Baris setelah validasi", len(main)),
+        ("Baris dihapus (bentrok IP)", len(S["deleted"])),
+        ("Jumlah perubahan nilai", len(log_df)),
+        ("Baris DITANDAI (validasi kosong / belum divalidasi)", len(marked_df)),
+        ("Data validasi tidak ditemukan di file sebelumnya", len(nf_df)),
+        ("Peringatan", len(warn_df)),
+    ], columns=["Keterangan", "Jumlah"])
+
+    main_bytes = to_excel({MAIN_SHEET: main}, {MAIN_SHEET: colors}, {MAIN_SHEET: cells})
+    report_bytes = to_excel({"Ringkasan": summary, "Log_Perubahan": log_df, "Ditandai": marked_df,
+                             "Tidak_Ditemukan": nf_df, "Peringatan": warn_df})
+    return dict(main=main, main_bytes=main_bytes, report_bytes=report_bytes, summary=summary,
+                log=log_df, marked=marked_df, notfound=nf_df, warns=warn_df)
+
+
+def validation_page():
+    st.title("✅ Terapkan Validasi (Perbaikan)")
+    st.caption("Upload file hasil olahan sebelumnya + file Excel validasi yang sudah Anda isi. "
+               "Aplikasi menerapkan perbaikan dan menandai baris yang validasinya masih kosong.")
+
+    with st.sidebar:
+        st.header("Menu yang diperbaiki")
+        menus = st.multiselect("Pilih menu", [MENU_IP, MENU_HOST], default=[MENU_IP])
+        st.header("Upload file")
+        f_prev = st.file_uploader("File hasil olahan sebelumnya (Reinvent_Updated.xlsx)",
+                                  type=["xlsx", "xls", "csv"], key="prev_main")
+        f_val = {}
+        if MENU_IP in menus:
+            f_val[MENU_IP] = st.file_uploader(
+                "Validasi 'IP sama, hostname beda' (kolom: IP, Hostname Re-invent, Hostname KRI, "
+                "VM/Baremetal Re-invent, VM/Baremetal KRI, Validasi Final Hostname)",
+                type=["xlsx", "xls", "csv"], key="val_ip")
+        if MENU_HOST in menus:
+            f_val[MENU_HOST] = st.file_uploader(
+                "Validasi 'Hostname sama, IP beda' (kolom: Hostname Re-invent, Hostname KRI, ip_oam Re-invent, "
+                "IP OAM KRI, VM/Baremetal Re-invent, VM/Baremetal KRI, Keterangan, Validasi IP_OAM)",
+                type=["xlsx", "xls", "csv"], key="val_host")
+
+    if not menus:
+        st.info("Pilih minimal satu menu di sidebar.")
+        st.stop()
+    if f_prev is None or any(f is None for f in f_val.values()):
+        st.info("Upload file hasil olahan sebelumnya dan file validasi untuk setiap menu yang dipilih.")
+        st.stop()
+
+    try:
+        prev_df, prev_fills, miss = read_prev_main(f_prev)
+    except Exception as e:
+        st.error(f"Gagal membaca file hasil sebelumnya: {e}")
+        st.stop()
+    if "Hostname" in miss:
+        st.error("Kolom Hostname tidak ditemukan di file hasil sebelumnya.")
+        st.stop()
+    if miss:
+        st.warning(f"Kolom tidak ditemukan di file sebelumnya (dikosongkan): {', '.join(miss)}")
+
+    specs = {MENU_IP: (VAL_IP_COLS, VAL_IP_ALIASES, "Validasi Final Hostname", "sheet IP_Sama_Hostname_Beda"),
+             MENU_HOST: (VAL_HOST_COLS, VAL_HOST_ALIASES, "Validasi IP_OAM", "sheet Hostname_Sama_IP_Beda")}
+    sheet_pref = {MENU_IP: "IP_Sama_Hostname_Beda", MENU_HOST: "Hostname_Sama_IP_Beda"}
+    jobs = []
+    for menu, f in f_val.items():
+        cols, aliases, must, _ = specs[menu]
+        try:
+            raw = read_any(f, f"Validasi {menu}", prefer_sheet=sheet_pref[menu])
+        except Exception as e:
+            st.error(f"Gagal membaca file validasi '{menu}': {e}")
+            st.stop()
+        val, miss_v = standardize(raw, cols, aliases)
+        need = [c for c in (must, "Hostname Re-invent") if c in miss_v]
+        if "IP" in miss_v and menu == MENU_IP:
+            need.append("IP")
+        if need:
+            st.error(f"File validasi '{menu}' wajib punya kolom: {', '.join(need)}")
+            st.stop()
+        jobs.append((menu, val))
+
+    S = run_validation(prev_df, prev_fills, jobs)
+    O = build_validation_outputs(S, len(prev_df))
+
+    sm = dict(zip(O["summary"]["Keterangan"], O["summary"]["Jumlah"]))
+    c = st.columns(4)
+    c[0].metric("Baris sebelum", sm["Baris file hasil sebelumnya"])
+    c[1].metric("Baris sesudah", sm["Baris setelah validasi"])
+    c[2].metric("Perubahan nilai", sm["Jumlah perubahan nilai"])
+    c[3].metric("Baris dihapus", sm["Baris dihapus (bentrok IP)"])
+    c = st.columns(3)
+    c[0].metric("🟥 Ditandai (validasi kosong)", sm["Baris DITANDAI (validasi kosong / belum divalidasi)"])
+    c[1].metric("Tidak ditemukan", sm["Data validasi tidak ditemukan di file sebelumnya"])
+    c[2].metric("Peringatan", sm["Peringatan"])
+
+    st.markdown("**Warna di file hasil:** 🟥 baris ditandai - Validasi Final Hostname / Validasi IP_OAM masih kosong "
+                "atau konflik belum ada di file validasi. Warna lain dari hasil sebelumnya dipertahankan.")
+
+    d1, d2 = st.columns(2)
+    d1.download_button("⬇️ Download FILE HASIL VALIDASI (format Re-invent)", O["main_bytes"],
+                       "Reinvent_Updated_Validasi.xlsx", XLSX, type="primary")
+    d2.download_button("⬇️ Download LAPORAN VALIDASI (log, ditandai, tidak ditemukan)", O["report_bytes"],
+                       "Laporan_Validasi.xlsx", XLSX)
+
+    tabs = st.tabs(["File hasil", "Log perubahan", "Ditandai (kosong)", "Tidak ditemukan", "Peringatan"])
+    for tab, df in zip(tabs, [O["main"], O["log"], O["marked"], O["notfound"], O["warns"]]):
+        with tab:
+            st.write(f"{len(df)} baris")
+            st.dataframe(df, hide_index=True)
+
+
 def main():
     st.set_page_config(page_title="Re-invent vs KRI", page_icon="🔍", layout="wide")
+
+    page = st.sidebar.radio("Halaman", ["1. Bandingkan data", "2. Terapkan validasi (perbaikan)"])
+    if page.startswith("2"):
+        validation_page()
+        return
 
     with st.sidebar:
         st.header("1. Sumber data")
@@ -726,8 +1134,14 @@ def main():
                     "Perlu dilengkapi", "Duplikat", "Log perubahan"])
     frames = [R["main"], R["kri_only"], R["re_only"], R["conf"], R["hip"], R["dismantle"],
               R["incomplete"], R["dup"], R["log"]]
-    for tab, df in zip(tabs, frames):
+    hints = {3: "Isi kolom **Validasi Final Hostname** di sheet `IP_Sama_Hostname_Beda` (file laporan), "
+                "lalu upload di halaman 2 (Terapkan validasi).",
+             4: "Isi kolom **Validasi IP_OAM** di sheet `Hostname_Sama_IP_Beda` (file laporan), "
+                "lalu upload di halaman 2 (Terapkan validasi)."}
+    for n, (tab, df) in enumerate(zip(tabs, frames)):
         with tab:
+            if n in hints:
+                st.caption(hints[n])
             st.write(f"{len(df)} baris")
             st.dataframe(df, hide_index=True)
 
